@@ -19,7 +19,10 @@
 | 重複検知の前提 (既存 insights への `content_sha256` バックフィル) | ✅ 完了 (id=1, 3, 5 / 全 3 件) |
 | claude.ai 用 ZIP ビルドスクリプト (`scripts/build-skill-zip.sh`) | ✅ 作成・実行確認済み |
 | **subagent 独立 audit (4 ラウンド)** | ✅ **完了** (Critical 8 + Important 6 + Nitpick 4 件 → 全解消、最終 verdict: READY FOR UPLOAD)。詳細: [`skill-audit-history.md`](./skill-audit-history.md) |
-| E2E 検証 (新規ファイル登録 → embedding → 検索) | ⏳ **未実施** (次セッションの最優先) |
+| **Unit tests (chunker.py)** | ✅ 18 cases / 17 PASS / 1 SKIP (code-fence、known limitation) |
+| **E2E 検証 (Claude Code 経路)** | ✅ **完了** 9 シナリオ全 PASS (S1-S6, S10, S11, S13)。詳細: [`skill-e2e-results.md`](./skill-e2e-results.md) |
+| E2E (Edge Function `mode:"query"` HTTP roundtrip) | ⏳ S12 deferred (service role key shell export が必要、本セッションでは MCP search_insights で代替検証) |
+| E2E (claude.ai 経路 — 実機 sandbox path resolution) | ⏳ アップロード後の実機検証で確認 |
 | claude.ai へのアップロード (UI 操作) | ⏳ ユーザー作業 (下記 §5 参照) |
 
 ---

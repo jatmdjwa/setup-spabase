@@ -46,7 +46,7 @@ description: 指定したファイル (またはテキスト) を Insights DB (S
 | 項目 | 推定の根拠 | 推定不能時のデフォルト (確認のうえ採用) |
 |---|---|---|
 | `source_app` | パスに `gemini` `chatgpt` `claude` `perplexity` `codex` を含むか | `manual` |
-| `source_type` | "deep_research" "transcript" などの語があるか | `conversation` |
+| `source_type` | "deep_research" "transcript" "book" "article" "meeting" "experience" の語があるか (handover §3 の enum: `conversation` / `book` / `article` / `meeting` / `experience` / `deep_research` / `transcript`) | `conversation` |
 | `title` | H1 / 最初の非空行 / frontmatter `title:` | (聞く) |
 
 ユーザーが「おまかせ」で返したら全項目デフォルトで進めてよい。
