@@ -5,7 +5,9 @@
 # ルール:
 #   - H1 / H2 で大章分割 (preamble は最初の見出し前テキスト)
 #   - 5,000字を超える章はさらに H3 → 段落単位で分割
-#   - 各 chunk の body は原文ママ (整形・正規化なし)
+#   - 各 chunk の body は原文ママ (前後の改行のみ除去、空白・タブは保持)
+
+from __future__ import annotations
 
 import json
 import re
@@ -21,12 +23,12 @@ def split_by_headings(md: str, levels: list[int]):
         m = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
         if m and len(m.group(1)) in levels:
             sections.append(
-                {"title": cur["title"], "level": cur["level"], "body": "\n".join(cur["lines"]).strip()}
+                {"title": cur["title"], "level": cur["level"], "body": "\n".join(cur["lines"]).strip("\n")}
             )
             cur = {"title": m.group(2).strip(), "level": len(m.group(1)), "lines": []}
         else:
             cur["lines"].append(line)
-    sections.append({"title": cur["title"], "level": cur["level"], "body": "\n".join(cur["lines"]).strip()})
+    sections.append({"title": cur["title"], "level": cur["level"], "body": "\n".join(cur["lines"]).strip("\n")})
     return [s for s in sections if s["body"] or s["title"] != "preamble"]
 
 

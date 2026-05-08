@@ -105,7 +105,7 @@ content のサイズに応じて読み方を変える (Vertex AI ではなく **
   "importance":     3,           // 1-5、特に指定なければ 3
   "metadata": {
     "content_sha256":   "<sha256>",
-    "imported_via":     "claude_code_skill_register_insight",
+    "imported_via":     "register_insight_v1",
     "skill_version":    "1.0",
     "char_count":       <LENGTH(content)>,
     "original_path":    "<絶対パス、path 指定の場合>",
@@ -118,29 +118,50 @@ content のサイズに応じて読み方を変える (Vertex AI ではなく **
 
 ## ステップ 3: insights INSERT
 
+> **重要**: Supabase MCP の `execute_sql` は **単一の SQL 文字列** を受け取る (PG プレースホルダ `$1` は使えない)。
+> 値は Claude が文字列リテラルとして埋め込むこと。**シングルクォート escape は `''` で 2 重化**。タグは `ARRAY['tag1','tag2']` 形式。jsonb は `'{"k":"v"}'::jsonb`。
+
 ### 3-1. 短文 (content ≤ 5,000字) の場合
 
+literal SQL を組み立てる例 (Claude が値を埋める):
+
 ```sql
--- $1=title $2=content $3=tags $4=category $5=summary $6=metadata $7=...
 INSERT INTO insights (
-  title, content, category, tags, summary, source_app, source_type,
-  importance, language, content_format, metadata
+  title, content, category, tags, summary,
+  source_app, source_type, importance,
+  language, content_format, metadata
 ) VALUES (
-  $1, $2, $4, $3::text[], $5, $6, $7,
-  $8, 'ja', 'markdown', $9::jsonb
+  '<escaped_title>',
+  '<escaped_content>',
+  '<category>',
+  ARRAY['<tag1>','<tag2>']::text[],
+  '<escaped_summary_or_NULL>',
+  '<source_app>',
+  '<source_type>',
+  3,
+  '<language>',         -- メタの language を使う ('ja' 等)
+  '<content_format>',   -- メタの content_format ('markdown' 等)
+  '<metadata_json>'::jsonb
 )
 RETURNING id;
 ```
 
-→ 取得した `insight_id` を保持。
+→ 結果から `insight_id` を取り出して保持。
 
 ### 3-2. 長文 (> 5,000字) の場合 — insight_documents + チャンク化が **必須**
 
-handover の落とし穴9: `insights.content` は max 100,000字。**100,000字超の場合は `content` に冒頭〜中盤の代表抜粋 (≤ 50,000字) を入れ、全文は `insight_documents.body` に保存する**。
+`insights.content` は schema 上 max 100,000字 (handover §schema)。**ただし原文不変 (§不変ルール 1) を厳守**するため:
+
+| 元の長さ | `insights.content` | `insights.content_normalized` | `insight_documents.body` |
+|---|---|---|---|
+| ≤ 100,000字 | 原文そのまま | (任意。AI整形版を入れる場合のみ) | 原文そのまま |
+| > 100,000字 | 原文の **先頭 100,000字をそのまま** (truncate flag を metadata に記録) | (任意) | 原文そのまま (≤1,000,000字) |
+
+> 100,000字超の入力は `metadata.content_truncated = true` と `metadata.full_length` を立て、`content` には先頭 N 字をそのまま (整形・要約せずに) 入れる。原文不変ルールに違反しない最小限の妥協。
 
 ```sql
--- (a) insights INSERT — content には全文 (≤100,000) または抜粋 (>100,000の場合)
-INSERT INTO insights (...) VALUES (...) RETURNING id;
+-- (a) insights INSERT
+INSERT INTO insights ( ... ) VALUES ( ... ) RETURNING id;
 
 -- (b) insight_documents INSERT — body には常に全文 (≤1,000,000)
 INSERT INTO insight_documents (
@@ -148,11 +169,11 @@ INSERT INTO insight_documents (
 ) VALUES (
   <insight_id>,
   'fulltext',           -- または 'deep_research' / 'transcript' / 'reference'
-  '<title>',
-  $body_text,
+  '<escaped_title>',
+  '<escaped_body>',     -- 原文ママ
   '<source_app>',
   'markdown',
-  jsonb_build_object('imported_via', 'claude_code_skill_register_insight')
+  jsonb_build_object('imported_via', 'register_insight_v1')
 )
 RETURNING id;
 ```
@@ -176,33 +197,53 @@ RETURNING id;
 python3 "$REPO_ROOT/.claude/skills/register-insight/lib/chunker.py" < /tmp/body.md > /tmp/chunks.json
 ```
 
-**claude.ai の場合** — sandbox cwd は skill 直下と限らない。`CLAUDE_SKILL_DIR` を優先し、なければ既知の skill 配置先を順に探索:
+**claude.ai の場合** — sandbox での skill 配置パスは公式仕様書に明記が無い。**3 段階の探索 + 最終フォールバック (chunker 関数を inline 定義)** を行う:
+
 ```python
-import os, sys, json
+import os, sys, json, subprocess, glob
 
-def _find_skill_dir():
-    # 1. 環境変数
+def _find_chunker_path():
+    # (1) 環境変数 (Claude Code 互換)
     d = os.environ.get("CLAUDE_SKILL_DIR")
-    if d and os.path.isfile(os.path.join(d, "lib", "chunker.py")):
-        return d
-    # 2. 既知の候補 (claude.ai sandbox の通常配置)
-    for base in ("/mnt/skills", "/mnt/user-data/skills", os.path.expanduser("~/skills"),
+    if d:
+        p = os.path.join(d, "lib", "chunker.py")
+        if os.path.isfile(p):
+            return p
+    # (2) 既知候補 (claude.ai sandbox での想定配置・未公式)
+    for base in ("/mnt/skills", "/mnt/user-data/skills",
+                 os.path.expanduser("~/skills"),
                  os.path.expanduser("~/.claude/skills"), "."):
-        cand = os.path.join(base, "register-insight")
-        if os.path.isfile(os.path.join(cand, "lib", "chunker.py")):
-            return cand
-    # 3. cwd 配下を浅く探索 (深すぎると遅いので 3 階層まで)
-    for depth in range(1, 4):
-        pattern = "/".join(["*"] * depth + ["register-insight", "lib", "chunker.py"])
-        import glob
-        m = glob.glob(pattern)
-        if m:
-            return os.path.dirname(os.path.dirname(m[0]))
-    raise RuntimeError("chunker.py が見つかりません — スキルが正しく展開されていない可能性")
+        p = os.path.join(base, "register-insight", "lib", "chunker.py")
+        if os.path.isfile(p):
+            return p
+    # (3) bash find でフォールバック (1 回限り、タイムアウト 10s)
+    try:
+        r = subprocess.run(
+            ["bash", "-c",
+             "find / -path '*register-insight*chunker.py' 2>/dev/null | head -1"],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = r.stdout.strip()
+        if out and os.path.isfile(out):
+            return out
+    except Exception:
+        pass
+    return None
 
-skill_dir = _find_skill_dir()
-sys.path.insert(0, os.path.join(skill_dir, "lib"))
-from chunker import chunk
+chunker_path = _find_chunker_path()
+if chunker_path:
+    sys.path.insert(0, os.path.dirname(chunker_path))
+    from chunker import chunk
+else:
+    # (4) フォールバック: SKILL.md には chunker のソースを inline で持っていないので、
+    # 見つからない場合は **Claude が chunker.py の内容をこの sandbox に書き出す**:
+    #   - スキル ZIP に含まれる lib/chunker.py の中身を Claude が知っているはず
+    #   - Claude は `with open('/tmp/chunker.py','w') as f: f.write('''<source>''')` を実行
+    #   - 上記 sys.path で /tmp を指して再 import
+    raise RuntimeError(
+        "chunker.py が見つかりません。Claude は lib/chunker.py の内容を "
+        "/tmp/chunker.py に書き出してから再実行すること。"
+    )
 
 chunks = chunk(body_text)
 print(json.dumps(chunks, ensure_ascii=False))
@@ -253,8 +294,8 @@ FROM insight_documents WHERE id = <document_id>;
 
 トリガは `pg_net` で **非同期 HTTP**。完了まで通常 5〜30 秒。
 
+**確認用 SQL** (両プラットフォーム共通):
 ```sql
--- 待機ループ (Bash 側で 5秒ごとに確認、最大 5分)
 SELECT
   (SELECT embedding IS NOT NULL FROM insights WHERE id = <insight_id>) AS insight_done,
   (SELECT COUNT(*) FROM document_chunks
@@ -262,6 +303,24 @@ SELECT
 ```
 
 `insight_done = true` かつ `chunks_pending = 0` で完了。
+
+### プラットフォーム別の実装
+
+**Claude Code の場合** — bash の until-loop で MCP `execute_sql` をポーリング:
+```bash
+# 5 秒間隔・最大 60 回 = 5 分
+for i in $(seq 1 60); do
+  # MCP execute_sql 経由で上記 SQL を実行 → JSON 結果を判定
+  # 完了したら break
+  sleep 5
+done
+```
+
+**claude.ai の場合** — sandbox 内では MCP を呼べない。**Claude (オーケストレータ) が** ループを駆動する:
+1. Claude が MCP `execute_sql` を呼んで上記 SQL を実行
+2. 結果が未完なら、Claude が **会話で「待機中…」と発話 → 数秒経過後に再度 MCP `execute_sql` を呼ぶ**
+3. これを最大 12 回 (≒ 5 分相当) 繰り返す。sandbox の `time.sleep` は使わない (使ってもオーケストレータ層には影響しない)
+4. 完了 or タイムアウトでループ終了
 
 タイムアウト (5分) しても未完なら:
 1. Edge Function ログ確認: Supabase MCP の `get_logs` ツール (`service="edge-function"`)。Claude Code では tool 名 `mcp__claude_ai_Supabase__get_logs`、claude.ai では connector が公開している同等ツール
@@ -373,10 +432,39 @@ FROM search_insights(
 
 ## 失敗時のロールバック方針
 
-ステップ 3 で insights INSERT 成功後にステップ 4 (チャンク登録) で失敗した場合:
-- **物理 DELETE しない** (handover ルール)
-- 代わりに `UPDATE insights SET is_archived = TRUE, metadata = metadata || '{"register_failed": true, "failed_step": "chunk"}'::jsonb WHERE id = <id>;`
-- ユーザーに失敗 step とログを報告し、修正後に再開
+handover の運用ルール: **`insights` の物理 DELETE は禁止** (`is_archived = TRUE` でソフト削除のみ)。
+一方 `insight_documents` / `document_chunks` は `insights` から派生する artifact なので、**FK CASCADE 前提で物理 DELETE 可** (実際 `replace_document_chunks()` も内部で chunks を DELETE→INSERT している)。
+
+### 失敗パターン別の対応
+
+| 失敗 step | 状態 | やること |
+|---|---|---|
+| Step 3-1 (短文 INSERT) で失敗 | insights 0 件作成 | 何もしない (DB 変更なし)。ユーザーに報告 |
+| Step 3-2 (a) (insights INSERT) で失敗 | insights 0 件作成 | 同上 |
+| Step 3-2 (b) (insight_documents INSERT) で失敗 | insights 1 件あり、document 0 件 | 下記 SQL (1) |
+| Step 4 (replace_document_chunks) で失敗 | insights 1 件、document 1 件、chunks 不完全 or 0 件 | 下記 SQL (2) |
+| Step 5 (embedding 待機タイムアウト) | 全件作成済みだが embedding 未完 | **ロールバックしない** (バックフィル script で再生成可能)。ユーザーに警告のみ |
+
+**SQL (1) — insight_documents 作成前にロールバック**:
+```sql
+UPDATE insights
+SET is_archived = TRUE,
+    metadata = metadata || '{"register_failed": true, "failed_step": "insight_documents"}'::jsonb
+WHERE id = <insight_id>;
+```
+
+**SQL (2) — チャンク登録失敗時の完全ロールバック**:
+```sql
+-- (a) document_chunks を物理削除 (FK CASCADE)
+DELETE FROM insight_documents WHERE id = <document_id>;
+-- (b) insights をソフト削除
+UPDATE insights
+SET is_archived = TRUE,
+    metadata = metadata || '{"register_failed": true, "failed_step": "chunks"}'::jsonb
+WHERE id = <insight_id>;
+```
+
+ユーザーに失敗 step とログを報告し、原因修正後に最初から再登録 (sha256 重複検知が効くため `is_archived=TRUE` 行は引っかからない — §1 の WHERE 句に `AND is_archived = FALSE` あり)。
 
 ---
 

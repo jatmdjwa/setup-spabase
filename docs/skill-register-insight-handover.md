@@ -14,7 +14,7 @@
 | 項目 | 状態 |
 |---|---|
 | スキル本体 (`SKILL.md`) | ✅ 作成済み (Claude Code / claude.ai 両対応) |
-| チャンク分割スクリプト (`lib/chunk.py`) | ✅ 作成・スモークテスト済み (両環境共通) |
+| チャンク分割スクリプト (`lib/chunker.py`) | ✅ 作成・スモークテスト済み (両環境共通) |
 | 重複検知の前提 (既存 insights への `content_sha256` バックフィル) | ✅ 完了 (id=1, 3, 5 / 全 3 件) |
 | claude.ai 用 ZIP ビルドスクリプト (`scripts/build-skill-zip.sh`) | ✅ 作成・実行確認済み |
 | E2E 検証 (新規ファイル登録 → embedding → 検索) | ⏳ **未実施** (次セッションの最優先) |
@@ -30,7 +30,7 @@
 .claude/skills/register-insight/
 ├── SKILL.md            # スキル定義 (Claude Code が読む手順書)
 └── lib/
-    └── chunk.py        # Markdown を H1/H2/H3/段落で分割する Python スクリプト
+    └── chunker.py        # Markdown を H1/H2/H3/段落で分割する Python スクリプト
 ```
 
 ### 1-2. スキルの責務
@@ -50,7 +50,7 @@
 2. `sha256(content)` で重複検知 (`metadata->>'content_sha256'` で WHERE)
 3. メタデータ抽出 (Claude 自身が本文を読む。50,000字超は先頭/中央/末尾サンプリング)
 4. `insights` INSERT
-5. 長文 (> 5,000字) なら `insight_documents` INSERT + `chunk.py` で分割 + `replace_document_chunks()`
+5. 長文 (> 5,000字) なら `insight_documents` INSERT + `chunker.py` で分割 + `replace_document_chunks()`
 6. embedding 生成完了の待機 (5秒間隔・最大5分)
 7. サンプル検索 1 件で登録レコードがヒットするか確認
 8. 完了報告
@@ -72,7 +72,7 @@
 
 ## 2. チャンク分割アルゴリズム
 
-`lib/chunk.py` の仕様 (handover §タスク2 のルールに準拠):
+`lib/chunker.py` の仕様 (handover §タスク2 のルールに準拠):
 
 - H1 / H2 で大章分割
 - 各章 5,000字超は H3 で再分割 → さらに段落単位で分割
@@ -87,11 +87,11 @@
 - 合計 chunk chars: 31,838 (元 32,267 から -429字 ≒ 章境界の連続改行ストリップ分)
 
 > -429字 の差は handover §落とし穴8 の「合計が一致しない」を緩く受容したもの。**logical な原文連続性は保たれている** (各 chunk は元の章セクションをそのまま切り出したもの)。
-> 厳密に「合計バイト一致」が必要な場合は `chunk.py` の `.strip()` を外す改修が必要 (将来課題)。
+> 厳密に「合計バイト一致」が必要な場合は `chunker.py` の `.strip()` を外す改修が必要 (将来課題)。
 
 ### 2-2. 既存実装との比較
 
-| 項目 | 既存 (claude.ai 手作業) | 新スキル (`chunk.py`) |
+| 項目 | 既存 (claude.ai 手作業) | 新スキル (`chunker.py`) |
 |---|---|---|
 | id=5 のチャンク数 | 12 (preamble + 7章 + 第7章を5パートに分割) | 10 (6章 + 第7章を4パートに分割) |
 | 文字差分 | -4字 | -429字 |
@@ -162,7 +162,7 @@ FROM insights;
 5. 検証完了後、テストレコードは `is_archived = TRUE` でソフト削除 (handover ルール)
 
 **E2E 検証で不足が見つかった場合の改修候補**:
-- `lib/chunk.py` の strip 緩和 (章境界の文字差分削減)
+- `lib/chunker.py` の strip 緩和 (章境界の文字差分削減)
 - 待機タイムアウト後のリトライロジック追加
 - frontmatter 解析の堅牢化 (YAML エラー時の挙動)
 
@@ -170,7 +170,7 @@ FROM insights;
 
 #### 現状
 - claude.ai の Skills は **sandbox 内で Python 標準ライブラリが実行可能** と確認 (Pro/Max/Team/Enterprise + Code Execution 有効化が前提)
-- `chunk.py` は stdlib のみ使用なので **そのまま動く**
+- `chunker.py` は stdlib のみ使用なので **そのまま動く**
 - Supabase MCP はチャット層から呼べる (Skill コードからは呼べないが、Skill を実行している Claude が呼べる)
 - Edge Function 呼び出しは Python `urllib` (stdlib) で実装済み・curl 依存なし
 - SKILL.md は Claude Code / claude.ai の両対応に書き換え済み (1 ファイルでメンテ)
@@ -180,7 +180,7 @@ FROM insights;
 # (1) ZIP を生成
 bash scripts/build-skill-zip.sh
 # → dist/register-insight-claude-ai.zip が出力される
-# ZIP root は register-insight/ (中に SKILL.md と lib/chunk.py)
+# ZIP root は register-insight/ (中に SKILL.md と lib/chunker.py)
 
 # (2) claude.ai にログイン
 # (3) Customize > Skills (https://claude.ai/customize/skills)
@@ -241,7 +241,7 @@ cd setup-spabase
 ```bash
 cd setup-spabase
 # チャンクスクリプトが動くか
-python3 .claude/skills/register-insight/lib/chunk.py < /dev/null
+python3 .claude/skills/register-insight/lib/chunker.py < /dev/null
 # (空入力なら "[]" が返れば OK)
 
 # Claude Code の Supabase MCP が繋がるか
@@ -253,7 +253,7 @@ python3 .claude/skills/register-insight/lib/chunk.py < /dev/null
 1. **本ドキュメント** (`docs/skill-register-insight-handover.md`) — まずここ
 2. `docs/insights-db-handover.md` — DB スキーマ・運用ルール (v4)
 3. `.claude/skills/register-insight/SKILL.md` — スキル本体の手順書
-4. `.claude/skills/register-insight/lib/chunk.py` — チャンク分割ロジック
+4. `.claude/skills/register-insight/lib/chunker.py` — チャンク分割ロジック
 
 ### 5-6. 想定される最初のアクション (次セッション開始時)
 
@@ -274,7 +274,7 @@ python3 .claude/skills/register-insight/lib/chunk.py < /dev/null
 | J4 | 単一 SKILL.md で Claude Code / claude.ai 両対応 | 2 ファイルに分けるとメンテ二重化 |
 | J5 | Python (Deno でなく) | プロジェクトに deno 未インストール。python3 はデフォルトで利用可。handover にも「Python での H2/H3 ベース」とある |
 | J6 | embedding 待機は 5 分タイムアウト | 既存 backfill 実績で chunks 12 件 ≦ 30 秒。5 分なら Edge Function 障害切り分け可能 |
-| J7 | claude.ai 移植は **同一 SKILL.md** で対応 (別ファイル化しない) | sandbox に Python が走り chunk.py がそのまま import できることを確認。Edge Function 呼出も urllib stdlib で書ける |
+| J7 | claude.ai 移植は **同一 SKILL.md** で対応 (別ファイル化しない) | sandbox に Python が走り chunker.py がそのまま import できることを確認。Edge Function 呼出も urllib stdlib で書ける |
 | J8 | ZIP は `dist/` (gitignore 済み)、ビルドは `scripts/build-skill-zip.sh` | バイナリ artifact を repo に入れない。再生成可能 |
 
 ---

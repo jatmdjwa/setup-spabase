@@ -15,7 +15,8 @@ rm -f "$OUT"
 # claude.ai expects the skill folder as ZIP root: register-insight/SKILL.md
 # (NOT bare SKILL.md at root)
 cd "$SKILL_PARENT"
-zip -r "$OUT" "$SKILL_NAME" -x "*.pyc" "**/__pycache__/*" "$SKILL_NAME/.*"
+zip -r "$OUT" "$SKILL_NAME" \
+  -x "*.pyc" "**/__pycache__/*" "*/.DS_Store" ".DS_Store" "*/.*"
 
 echo "Built: $OUT"
 unzip -l "$OUT"
