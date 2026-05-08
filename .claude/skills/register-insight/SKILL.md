@@ -174,7 +174,7 @@ INSERT INTO insight_documents (
   'fulltext',           -- または 'deep_research' / 'transcript' / 'reference'
   '<escaped_title>',
   '<escaped_body>',     -- 原文ママ
-  '<source_app>',
+  '<escaped_source_app>',
   'markdown',
   jsonb_build_object('imported_via', 'register_insight_v1')
 )
@@ -398,15 +398,17 @@ curl -s -X POST "$SUPABASE_URL/functions/v1/generate-embedding" \
 ```python
 # qvec は list[float] 768 要素。pgvector のリテラル形式にする
 vec_lit = "[" + ",".join(f"{x:.6f}" for x in qvec) + "]"
+escaped_query = QUERY.replace("'", "''")  # ユーザー由来語の二重化 escape
 sql = f"""
 SELECT id, title, similarity
 FROM search_insights(
-  query_text := '<escaped_query>',
+  query_text := '{escaped_query}',
   query_embedding := '{vec_lit}'::vector(768),
   match_threshold := 0.0,
   match_count := 5
 );
 """
+# 上記 sql を MCP execute_sql に渡す
 ```
 
 登録した `insight_id` が上位 5 件に入っていれば PASS。入らなければユーザーに警告 (登録は成功しているが、handover §0 落とし穴10/11 の length-bias / hybrid AND の影響の可能性)。

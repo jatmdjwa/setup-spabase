@@ -1,11 +1,12 @@
-# register-insight スキル 引継ぎドキュメント (v1.1)
+# register-insight スキル 引継ぎドキュメント (v1.2)
 
-最終更新: 2026-05-08 (claude.ai 移植対応)
+最終更新: 2026-05-08 (subagent audit 4 ラウンド完了、READY FOR UPLOAD)
 
 このドキュメントは Claude Code 用スキル `register-insight` の **作業履歴・現状・残タスク** をまとめたもの。別端末でも `git pull` 後にこの 1 ファイルを読めば作業継続できる。
 
 関連ドキュメント (必読):
 - [`docs/insights-db-handover.md`](./insights-db-handover.md) — Insights DB 全体の handover (v4)。スキーマ・運用ルール・落とし穴の出典。
+- [`docs/skill-audit-history.md`](./skill-audit-history.md) — subagent 4 ラウンドの監査・修正履歴 (本スキルが READY と判定された経緯)。
 
 ---
 
@@ -17,6 +18,7 @@
 | チャンク分割スクリプト (`lib/chunker.py`) | ✅ 作成・スモークテスト済み (両環境共通) |
 | 重複検知の前提 (既存 insights への `content_sha256` バックフィル) | ✅ 完了 (id=1, 3, 5 / 全 3 件) |
 | claude.ai 用 ZIP ビルドスクリプト (`scripts/build-skill-zip.sh`) | ✅ 作成・実行確認済み |
+| **subagent 独立 audit (4 ラウンド)** | ✅ **完了** (Critical 8 + Important 6 + Nitpick 4 件 → 全解消、最終 verdict: READY FOR UPLOAD)。詳細: [`skill-audit-history.md`](./skill-audit-history.md) |
 | E2E 検証 (新規ファイル登録 → embedding → 検索) | ⏳ **未実施** (次セッションの最優先) |
 | claude.ai へのアップロード (UI 操作) | ⏳ ユーザー作業 (下記 §5 参照) |
 
@@ -276,6 +278,11 @@ python3 .claude/skills/register-insight/lib/chunker.py < /dev/null
 | J6 | embedding 待機は 5 分タイムアウト | 既存 backfill 実績で chunks 12 件 ≦ 30 秒。5 分なら Edge Function 障害切り分け可能 |
 | J7 | claude.ai 移植は **同一 SKILL.md** で対応 (別ファイル化しない) | sandbox に Python が走り chunker.py がそのまま import できることを確認。Edge Function 呼出も urllib stdlib で書ける |
 | J8 | ZIP は `dist/` (gitignore 済み)、ビルドは `scripts/build-skill-zip.sh` | バイナリ artifact を repo に入れない。再生成可能 |
+| J9 | MCP `execute_sql` は **literal SQL のみ**、PG プレースホルダ `$N` 不可 | Round 3-4 audit で `$1::vector` `$chunks_jsonb::jsonb` 残存を検出。値は Claude が文字列リテラルに展開、`'` は `''` に二重化 escape |
+| J10 | wait loop は **Claude (オーケストレータ) が駆動**、bash / sandbox Python から MCP 直接呼出は不可 | bash の `sleep` は時間調整のみ。各反復で Claude が MCP ツールを呼び直す |
+| J11 | Rollback: `insights` 物理 DELETE 禁止、`insight_documents` / `document_chunks` は派生 artifact のため物理 DELETE 可 | `replace_document_chunks()` も内部で DELETE→INSERT。Step 4 失敗時は documents DELETE (CASCADE) + insights archive |
+| J12 | 100,000字超の入力は `insights.content` に **先頭 100,000 文字をそのまま** (truncate flag 付き) | AI 要約・整形は使わない (§不変ルール 1)。`original[:100000]` で UTF-8 安全 char-slice |
+| J13 | 監査は **subagent 独立 audit 2-3 ラウンド** が高効率 | manual review より bug 発見率が高く、修正反映漏れも次ラウンドで捕捉。詳細: [skill-audit-history.md](./skill-audit-history.md) |
 
 ---
 
