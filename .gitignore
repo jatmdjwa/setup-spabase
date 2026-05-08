@@ -11,6 +11,10 @@
 supabase/.temp/
 supabase/.branches/
 
+# Python
+__pycache__/
+*.pyc
+
 # Node
 node_modules/
 npm-debug.log*
