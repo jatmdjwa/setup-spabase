@@ -11,14 +11,26 @@ description: 指定したファイル (またはテキスト) を Insights DB (S
 
 ---
 
+## プラットフォーム
+
+このスキルは **Claude Code と claude.ai の両方** で動く。
+
+| プラットフォーム | 入力方法 | スクリプト実行 | DB 操作 |
+|---|---|---|---|
+| Claude Code | `Read` でファイルパス読み込み | `python3` 直接実行 | Supabase MCP |
+| claude.ai (Skills) | 添付ファイル or 本文貼付 | code execution sandbox で `python` | Supabase MCP (チャット層) |
+
+スクリプトは **すべて Python (標準ライブラリのみ)** で書かれており、両環境で同じコードが動く。シェルコマンド (`shasum` / `curl` 等) には依存しない。
+
 ## 入力の受付
 
 呼び出し時に以下のいずれかが提供される:
 
-- **(A) ファイルパス**: ローカルファイルを `Read` ツールで読む
-- **(B) 直接テキスト**: 引数や直前の会話に本文が貼り付けられている (claude.ai 互換)
+- **(A) ファイルパス**: ローカルファイルを `Read` ツールで読む (Claude Code)
+- **(B) 添付ファイル**: claude.ai の attachment として渡される
+- **(C) 直接テキスト**: 引数や直前の会話に本文が貼り付けられている
 
-どちらの場合も、**本文 (`content`) と "想定ファイル名 / タイトル候補"** を確保する。タイトル候補が不明なときは:
+どの場合も、**本文 (`content`) と "想定ファイル名 / タイトル候補"** を確保する。タイトル候補が不明なときは:
 1. 本文の最初の H1 (`# ...`) を使う
 2. それも無ければ最初の非空行 (≤ 200字) を使う
 3. それも無ければユーザーに聞く
@@ -41,9 +53,15 @@ description: 指定したファイル (またはテキスト) を Insights DB (S
 
 ## ステップ 1: 本文準備 & 重複検知
 
-1. `Read` でファイル全文を取得 (path 指定の場合)
+1. 入力に応じて本文を取得:
+   - Claude Code: `Read` でファイル読み込み
+   - claude.ai: 添付ファイル → sandbox の `open()` または会話本文
 2. **content は原文ママ** (整形禁止)。ただし frontmatter 部分 (`---\n...\n---`) があれば content からは除外し、metadata に保存
-3. `sha256` を計算: `shasum -a 256 <path>` または `printf '%s' "$content" | shasum -a 256`
+3. `sha256` を計算 (両プラットフォーム共通の Python 1 行):
+   ```python
+   import hashlib
+   sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+   ```
 4. 重複チェック (MCP `execute_sql`):
 
 ```sql
@@ -148,11 +166,22 @@ RETURNING id;
 
 ### 4-1. チャンク生成
 
-`lib/chunk.py` (本スキル同梱の Python スクリプト) を使う:
+`lib/chunk.py` (本スキル同梱の Python スクリプト) を使う。スキルルートからの相対パスは `lib/chunk.py`。
 
+**Claude Code の場合**:
 ```bash
-# stdin に body を流し込む
 python3 .claude/skills/register-insight/lib/chunk.py < /tmp/body.md > /tmp/chunks.json
+```
+
+**claude.ai の場合** (sandbox の Python から直接 import):
+```python
+# スキル ZIP は sandbox に展開済み。lib/chunk.py が読める
+import sys
+sys.path.insert(0, "lib")
+from chunk import chunk
+chunks = chunk(body_text)
+import json
+print(json.dumps(chunks, ensure_ascii=False))
 ```
 
 出力は:
@@ -236,8 +265,27 @@ const queryEmbedding = await fetch(
 ).then((r) => r.json());
 ```
 
-簡便版として MCP `execute_sql` から `search_insights` を呼ぶ場合は、別途 query embedding を渡す必要があるため、**Bash で 1 回 Edge Function を叩いて取得 → SQL に埋める** のが最短:
+簡便版として MCP `execute_sql` から `search_insights` を呼ぶ場合は、別途 query embedding を渡す必要があるため、**Edge Function を 1 回叩いて取得 → SQL に埋める** のが最短。
 
+両プラットフォーム共通の Python (urllib のみ・標準ライブラリ):
+
+```python
+import json, os, urllib.request
+
+req = urllib.request.Request(
+    f"{os.environ['SUPABASE_URL']}/functions/v1/generate-embedding",
+    method="POST",
+    headers={
+        "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_ROLE_KEY']}",
+        "Content-Type": "application/json",
+    },
+    data=json.dumps({"mode": "query", "text": QUERY}).encode("utf-8"),
+)
+resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+qvec = resp["embedding"]   # list[float] 768-dim
+```
+
+Claude Code で curl を使いたい場合は:
 ```bash
 curl -s -X POST "$SUPABASE_URL/functions/v1/generate-embedding" \
   -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
@@ -286,7 +334,9 @@ FROM search_insights(
 - Supabase project ref: `gntgcxdbcbywfboejimz`
 - Edge Function URL: `https://gntgcxdbcbywfboejimz.supabase.co/functions/v1/generate-embedding`
 - DB クエリは MCP `mcp__claude_ai_Supabase__execute_sql` を使用 (project_id: `gntgcxdbcbywfboejimz`)
-- Edge Function 直接呼び出しが必要な場合のみ `SUPABASE_SERVICE_ROLE_KEY` 環境変数を使う (curl)。**ユーザーに事前に export しておいてもらう**。
+- Edge Function 直接呼び出しが必要な場合のみ `SUPABASE_SERVICE_ROLE_KEY` (Claude Code: shell env, claude.ai: 会話で受け取る) を使う。
+  - **Claude Code**: ユーザーに事前に `export SUPABASE_SERVICE_ROLE_KEY=...` してもらう
+  - **claude.ai**: 検証検索を行う場合のみ、ユーザーから service role key を 1 回提示してもらう (skip 可)
 
 ---
 

@@ -1,6 +1,6 @@
-# register-insight スキル 引継ぎドキュメント (v1)
+# register-insight スキル 引継ぎドキュメント (v1.1)
 
-最終更新: 2026-05-08
+最終更新: 2026-05-08 (claude.ai 移植対応)
 
 このドキュメントは Claude Code 用スキル `register-insight` の **作業履歴・現状・残タスク** をまとめたもの。別端末でも `git pull` 後にこの 1 ファイルを読めば作業継続できる。
 
@@ -13,11 +13,12 @@
 
 | 項目 | 状態 |
 |---|---|
-| スキル本体 (`SKILL.md`) | ✅ 作成済み |
-| チャンク分割スクリプト (`lib/chunk.py`) | ✅ 作成・スモークテスト済み |
+| スキル本体 (`SKILL.md`) | ✅ 作成済み (Claude Code / claude.ai 両対応) |
+| チャンク分割スクリプト (`lib/chunk.py`) | ✅ 作成・スモークテスト済み (両環境共通) |
 | 重複検知の前提 (既存 insights への `content_sha256` バックフィル) | ✅ 完了 (id=1, 3, 5 / 全 3 件) |
+| claude.ai 用 ZIP ビルドスクリプト (`scripts/build-skill-zip.sh`) | ✅ 作成・実行確認済み |
 | E2E 検証 (新規ファイル登録 → embedding → 検索) | ⏳ **未実施** (次セッションの最優先) |
-| claude.ai 移植 | ⏳ E2E 後に検討 |
+| claude.ai へのアップロード (UI 操作) | ⏳ ユーザー作業 (下記 §5 参照) |
 
 ---
 
@@ -165,16 +166,31 @@ FROM insights;
 - 待機タイムアウト後のリトライロジック追加
 - frontmatter 解析の堅牢化 (YAML エラー時の挙動)
 
-### タスク #8 — claude.ai 移植 (E2E 後)
+### タスク #8 — claude.ai 移植 (✅ コード完了 / アップロードはユーザー作業)
 
-claude.ai の Skills 機能に同じ SKILL.md を載せる。差分:
-- Read ツールが無いので、入力は **本文を直接渡す** ルートのみ使う
-- ローカルファイルシステム不可なので `chunk.py` をどう実行するか検討:
-  - (a) MCP 経由で Supabase 上の SQL 関数として再実装 (複雑)
-  - (b) スキル内に Python 相当のロジックを SKILL.md に擬似コードで埋め、Claude が逐次実行 (現実的)
-  - (c) claude.ai 側でも sandbox python が動くなら chunk.py を bundle (要調査)
+#### 現状
+- claude.ai の Skills は **sandbox 内で Python 標準ライブラリが実行可能** と確認 (Pro/Max/Team/Enterprise + Code Execution 有効化が前提)
+- `chunk.py` は stdlib のみ使用なので **そのまま動く**
+- Supabase MCP はチャット層から呼べる (Skill コードからは呼べないが、Skill を実行している Claude が呼べる)
+- Edge Function 呼び出しは Python `urllib` (stdlib) で実装済み・curl 依存なし
+- SKILL.md は Claude Code / claude.ai の両対応に書き換え済み (1 ファイルでメンテ)
 
-→ **推奨: (b)**。SKILL.md にチャンクアルゴリズムを 1 セクション追加し、Claude code interpreter で実行させる。
+#### claude.ai へのアップロード手順 (ユーザー作業)
+```bash
+# (1) ZIP を生成
+bash scripts/build-skill-zip.sh
+# → dist/register-insight-claude-ai.zip が出力される
+
+# (2) claude.ai にログイン
+# (3) Settings > Features > Skills (要 Code Execution 有効化)
+# (4) "Upload skill" → dist/register-insight-claude-ai.zip を選択
+# (5) スキル一覧に register-insight が出ればアップロード成功
+```
+
+#### claude.ai 側での使い方
+- 新規チャットを開く → 添付ファイル投入 or 本文貼付
+- 「register-insight でこれを登録して」と発言
+- Claude が SKILL.md の手順に従って自動処理
 
 ### タスク #9 — handover §0 将来改善
 
@@ -251,6 +267,8 @@ python3 .claude/skills/register-insight/lib/chunk.py < /dev/null
 | J4 | 単一 SKILL.md で Claude Code / claude.ai 両対応 | 2 ファイルに分けるとメンテ二重化 |
 | J5 | Python (Deno でなく) | プロジェクトに deno 未インストール。python3 はデフォルトで利用可。handover にも「Python での H2/H3 ベース」とある |
 | J6 | embedding 待機は 5 分タイムアウト | 既存 backfill 実績で chunks 12 件 ≦ 30 秒。5 分なら Edge Function 障害切り分け可能 |
+| J7 | claude.ai 移植は **同一 SKILL.md** で対応 (別ファイル化しない) | sandbox に Python が走り chunk.py がそのまま import できることを確認。Edge Function 呼出も urllib stdlib で書ける |
+| J8 | ZIP は `dist/` (gitignore 済み)、ビルドは `scripts/build-skill-zip.sh` | バイナリ artifact を repo に入れない。再生成可能 |
 
 ---
 
