@@ -118,7 +118,7 @@ content のサイズに応じて読み方を変える (Vertex AI ではなく **
 
 ## ステップ 3: insights INSERT
 
-### 3-1. 短文 (content ≤ 100,000字 かつ ≤ 5,000字) の場合
+### 3-1. 短文 (content ≤ 5,000字) の場合
 
 ```sql
 -- $1=title $2=content $3=tags $4=category $5=summary $6=metadata $7=...
@@ -168,28 +168,41 @@ RETURNING id;
 
 ### 4-1. チャンク生成
 
-`lib/chunk.py` (本スキル同梱の Python スクリプト) を使う。スキルルートからの相対パスは `lib/chunk.py`。
+`lib/chunker.py` (本スキル同梱の Python スクリプト) を使う。スキルルートからの相対パスは `lib/chunker.py`。
+> ファイル名は **chunker.py** (stdlib の `chunk` モジュールとの衝突回避)。
 
 **Claude Code の場合** — リポジトリ内の絶対パスで実行:
 ```bash
-python3 "$REPO_ROOT/.claude/skills/register-insight/lib/chunk.py" < /tmp/body.md > /tmp/chunks.json
+python3 "$REPO_ROOT/.claude/skills/register-insight/lib/chunker.py" < /tmp/body.md > /tmp/chunks.json
 ```
 
-**claude.ai の場合** — sandbox cwd は skill 直下と限らない。`CLAUDE_SKILL_DIR` を優先し、なければファイル探索で fallback:
+**claude.ai の場合** — sandbox cwd は skill 直下と限らない。`CLAUDE_SKILL_DIR` を優先し、なければ既知の skill 配置先を順に探索:
 ```python
-import os, sys, glob, json
+import os, sys, json
 
-skill_dir = os.environ.get("CLAUDE_SKILL_DIR")
-if not skill_dir or not os.path.isfile(os.path.join(skill_dir, "lib", "chunk.py")):
-    # fallback: sandbox 内を探す
-    matches = glob.glob("**/register-insight/lib/chunk.py", recursive=True) \
-              or glob.glob("**/lib/chunk.py", recursive=True)
-    if not matches:
-        raise RuntimeError("chunk.py が見つかりません — スキルが正しく展開されていない可能性")
-    skill_dir = os.path.dirname(os.path.dirname(matches[0]))
+def _find_skill_dir():
+    # 1. 環境変数
+    d = os.environ.get("CLAUDE_SKILL_DIR")
+    if d and os.path.isfile(os.path.join(d, "lib", "chunker.py")):
+        return d
+    # 2. 既知の候補 (claude.ai sandbox の通常配置)
+    for base in ("/mnt/skills", "/mnt/user-data/skills", os.path.expanduser("~/skills"),
+                 os.path.expanduser("~/.claude/skills"), "."):
+        cand = os.path.join(base, "register-insight")
+        if os.path.isfile(os.path.join(cand, "lib", "chunker.py")):
+            return cand
+    # 3. cwd 配下を浅く探索 (深すぎると遅いので 3 階層まで)
+    for depth in range(1, 4):
+        pattern = "/".join(["*"] * depth + ["register-insight", "lib", "chunker.py"])
+        import glob
+        m = glob.glob(pattern)
+        if m:
+            return os.path.dirname(os.path.dirname(m[0]))
+    raise RuntimeError("chunker.py が見つかりません — スキルが正しく展開されていない可能性")
 
+skill_dir = _find_skill_dir()
 sys.path.insert(0, os.path.join(skill_dir, "lib"))
-from chunk import chunk
+from chunker import chunk
 
 chunks = chunk(body_text)
 print(json.dumps(chunks, ensure_ascii=False))
@@ -351,7 +364,7 @@ FROM search_insights(
 
 - Supabase project ref: `gntgcxdbcbywfboejimz`
 - Edge Function URL: `https://gntgcxdbcbywfboejimz.supabase.co/functions/v1/generate-embedding`
-- DB クエリは MCP `mcp__claude_ai_Supabase__execute_sql` を使用 (project_id: `gntgcxdbcbywfboejimz`)
+- DB クエリは Supabase MCP の `execute_sql` 同等ツールを使用 (project_id: `gntgcxdbcbywfboejimz`)。Claude Code では tool 名 `mcp__claude_ai_Supabase__execute_sql`、claude.ai では connector が公開している同等ツール (名称は connector 実装に依存)
 - Edge Function 直接呼び出しが必要な場合のみ `SUPABASE_SERVICE_ROLE_KEY` (Claude Code: shell env, claude.ai: 会話で受け取る) を使う。
   - **Claude Code**: ユーザーに事前に `export SUPABASE_SERVICE_ROLE_KEY=...` してもらう
   - **claude.ai**: 検証検索を行う場合のみ、ユーザーから service role key を 1 回提示してもらう (skip 可)
