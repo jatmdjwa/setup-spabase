@@ -59,11 +59,12 @@ description: 指定したファイル (またはテキスト) を Insights DB (S
    - Claude Code: `Read` でファイル読み込み
    - claude.ai: 添付ファイル → sandbox の `open()` または会話本文
 2. **content は原文ママ** (整形禁止)。ただし frontmatter 部分 (`---\n...\n---`) があれば content からは除外し、metadata に保存
-3. `sha256` を計算 (両プラットフォーム共通の Python 1 行):
+3. `sha256` を計算 — **frontmatter 除去後の content を対象** (両プラットフォーム共通の Python 1 行):
    ```python
    import hashlib
    sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
    ```
+   > 既存 3 件 (id=1,3,5) はバックフィル時 frontmatter 無しの content を hash しているので、本ルールと整合する。frontmatter のみ変更したファイルを再 import すると同じ sha256 → 重複検知される (意図通り)。
 4. 重複チェック (MCP `execute_sql`):
 
 ```sql
@@ -119,11 +120,12 @@ content のサイズに応じて読み方を変える (Vertex AI ではなく **
 ## ステップ 3: insights INSERT
 
 > **重要**: Supabase MCP の `execute_sql` は **単一の SQL 文字列** を受け取る (PG プレースホルダ `$1` は使えない)。
-> 値は Claude が文字列リテラルとして埋め込むこと。**シングルクォート escape は `''` で 2 重化**。タグは `ARRAY['tag1','tag2']` 形式。jsonb は `'{"k":"v"}'::jsonb`。
+> **すべての文字列リテラル slot** で、ユーザー由来 / Claude 抽出値の **シングルクォート (`'`) を `''` に二重化** すること (例外なし)。
+> 数値 slot (`importance` 等) はクォート不要。タグは `ARRAY['tag1','tag2']::text[]` (各要素も escape)。jsonb は `'{"k":"v"}'::jsonb`。
 
 ### 3-1. 短文 (content ≤ 5,000字) の場合
 
-literal SQL を組み立てる例 (Claude が値を埋める):
+literal SQL を組み立てる例。`<...>` 内は **全て** 二重化 escape 済みの値:
 
 ```sql
 INSERT INTO insights (
@@ -133,15 +135,15 @@ INSERT INTO insights (
 ) VALUES (
   '<escaped_title>',
   '<escaped_content>',
-  '<category>',
-  ARRAY['<tag1>','<tag2>']::text[],
+  '<escaped_category>',
+  ARRAY['<escaped_tag1>','<escaped_tag2>']::text[],
   '<escaped_summary_or_NULL>',
-  '<source_app>',
-  '<source_type>',
+  '<escaped_source_app>',
+  '<escaped_source_type>',
   3,
-  '<language>',         -- メタの language を使う ('ja' 等)
-  '<content_format>',   -- メタの content_format ('markdown' 等)
-  '<metadata_json>'::jsonb
+  '<escaped_language>',
+  '<escaped_content_format>',
+  '<escaped_metadata_json>'::jsonb
 )
 RETURNING id;
 ```
@@ -157,7 +159,8 @@ RETURNING id;
 | ≤ 100,000字 | 原文そのまま | (任意。AI整形版を入れる場合のみ) | 原文そのまま |
 | > 100,000字 | 原文の **先頭 100,000字をそのまま** (truncate flag を metadata に記録) | (任意) | 原文そのまま (≤1,000,000字) |
 
-> 100,000字超の入力は `metadata.content_truncated = true` と `metadata.full_length` を立て、`content` には先頭 N 字をそのまま (整形・要約せずに) 入れる。原文不変ルールに違反しない最小限の妥協。
+> 100,000字超の入力は `metadata.content_truncated = true` / `metadata.full_length = <元の文字数>` を立て、`content` には先頭 N **文字** (Python では `original[:100000]` で UTF-8 安全に char-slice) をそのまま (整形・要約せずに) 入れる。原文不変ルールに違反しない最小限の妥協。
+> `metadata.char_count` は **元の (truncate前の) 文字数** を入れる (= `metadata.full_length` と一致)。`insights.content` の長さではない。
 
 ```sql
 -- (a) insights INSERT
@@ -265,14 +268,24 @@ print(json.dumps(chunks, ensure_ascii=False))
 
 ### 4-2. replace_document_chunks() で一括登録
 
+`execute_sql` は文字列リテラルしか受け取らないので、4-1 で得た JSON を SQL に **インライン** する。
+JSON 文字列内のシングルクォート (`'`) は `''` に二重化し、jsonb リテラルとして埋め込む。
+
 ```sql
 SELECT replace_document_chunks(
   <document_id>,
-  $chunks_jsonb::jsonb
+  '<escaped_chunks_json>'::jsonb
 );
 ```
 
-ここで `$chunks_jsonb` は 4-1 の出力。トリガが発火し、各 chunk の embedding が **非同期** で生成される。
+実装ヒント:
+```python
+escaped = json.dumps(chunks, ensure_ascii=False).replace("'", "''")
+sql = f"SELECT replace_document_chunks({document_id}, '{escaped}'::jsonb);"
+# 上記 sql を MCP execute_sql に渡す
+```
+
+トリガが発火し、各 chunk の embedding が **非同期** で生成される。
 
 ### 4-3. 整合性チェック (handover §タスク2の検証手順)
 
@@ -304,23 +317,19 @@ SELECT
 
 `insight_done = true` かつ `chunks_pending = 0` で完了。
 
-### プラットフォーム別の実装
+### 実装方法 (両プラットフォーム共通)
 
-**Claude Code の場合** — bash の until-loop で MCP `execute_sql` をポーリング:
-```bash
-# 5 秒間隔・最大 60 回 = 5 分
-for i in $(seq 1 60); do
-  # MCP execute_sql 経由で上記 SQL を実行 → JSON 結果を判定
-  # 完了したら break
-  sleep 5
-done
-```
+**MCP は Claude (オーケストレータ層) からしか呼べない**。bash for-loop や sandbox Python から MCP を直接呼ぶことはできないので、**Claude 自身がループを駆動する**:
 
-**claude.ai の場合** — sandbox 内では MCP を呼べない。**Claude (オーケストレータ) が** ループを駆動する:
-1. Claude が MCP `execute_sql` を呼んで上記 SQL を実行
-2. 結果が未完なら、Claude が **会話で「待機中…」と発話 → 数秒経過後に再度 MCP `execute_sql` を呼ぶ**
-3. これを最大 12 回 (≒ 5 分相当) 繰り返す。sandbox の `time.sleep` は使わない (使ってもオーケストレータ層には影響しない)
-4. 完了 or タイムアウトでループ終了
+1. Claude が Supabase MCP `execute_sql` を呼んで上記 SQL を実行
+2. 結果が未完なら、Claude が次のいずれかで短い待機を挟む:
+   - **Claude Code**: Bash ツールで `sleep 5` を実行 (実時間で 5 秒経過)
+   - **claude.ai**: sandbox の `time.sleep(5)` (sandbox は別プロセスなのでオーケストレータ層は待機しないが、結果待ちのプロキシとして使う) または、待機を挟まず即座に再ポーリング
+3. 再度 MCP `execute_sql` を呼ぶ
+4. 最大 60 回 (≒ 5 分) 繰り返す
+5. 完了 or タイムアウトでループ終了
+
+> **重要**: `for i in $(seq 1 60); do ... done` のような bash 単体スクリプトでは MCP を呼べない。bash は `sleep` 用途のみで、SQL 実行は毎回 Claude が MCP ツールを呼び直す。
 
 タイムアウト (5分) しても未完なら:
 1. Edge Function ログ確認: Supabase MCP の `get_logs` ツール (`service="edge-function"`)。Claude Code では tool 名 `mcp__claude_ai_Supabase__get_logs`、claude.ai では connector が公開している同等ツール
@@ -384,15 +393,20 @@ curl -s -X POST "$SUPABASE_URL/functions/v1/generate-embedding" \
   | jq -r '.embedding | tostring' > /tmp/qvec.json
 ```
 
-```sql
--- 取得した vector で検索
+取得した embedding 配列を SQL 文字列リテラルとして埋め込む (`execute_sql` は placeholder 不可):
+
+```python
+# qvec は list[float] 768 要素。pgvector のリテラル形式にする
+vec_lit = "[" + ",".join(f"{x:.6f}" for x in qvec) + "]"
+sql = f"""
 SELECT id, title, similarity
 FROM search_insights(
-  query_text := '<query>',
-  query_embedding := $1::vector(768),
+  query_text := '<escaped_query>',
+  query_embedding := '{vec_lit}'::vector(768),
   match_threshold := 0.0,
   match_count := 5
 );
+"""
 ```
 
 登録した `insight_id` が上位 5 件に入っていれば PASS。入らなければユーザーに警告 (登録は成功しているが、handover §0 落とし穴10/11 の length-bias / hybrid AND の影響の可能性)。
