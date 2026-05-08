@@ -180,12 +180,19 @@ FROM insights;
 # (1) ZIP を生成
 bash scripts/build-skill-zip.sh
 # → dist/register-insight-claude-ai.zip が出力される
+# ZIP root は register-insight/ (中に SKILL.md と lib/chunk.py)
 
 # (2) claude.ai にログイン
-# (3) Settings > Features > Skills (要 Code Execution 有効化)
-# (4) "Upload skill" → dist/register-insight-claude-ai.zip を選択
-# (5) スキル一覧に register-insight が出ればアップロード成功
+# (3) Customize > Skills (https://claude.ai/customize/skills)
+#     ※ プラン: Pro / Max / Team / Enterprise + Code Execution 有効化
+# (4) "+" → "+ Create skill" → "Upload a skill"
+# (5) dist/register-insight-claude-ai.zip を選択
+# (6) スキル一覧に register-insight が出ればアップロード成功
 ```
+
+> **claude.ai 側の制約 (2026-05-08 時点)**:
+> - sandbox は既定で外部 HTTP egress 不可 (allowlist 制)。Edge Function 直叩きの検証検索 (Step 6) はスキップが安全
+> - MCP tool 名 (`mcp__claude_ai_Supabase__execute_sql` 等) は connector の実装で変わる可能性あり。Claude が現時点で利用可能な MCP ツール一覧を参照して `execute_sql` 同等を選択すべし
 
 #### claude.ai 側での使い方
 - 新規チャットを開く → 添付ファイル投入 or 本文貼付

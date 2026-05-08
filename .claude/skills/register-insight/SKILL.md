@@ -15,19 +15,21 @@ description: 指定したファイル (またはテキスト) を Insights DB (S
 
 このスキルは **Claude Code と claude.ai の両方** で動く。
 
-| プラットフォーム | 入力方法 | スクリプト実行 | DB 操作 |
-|---|---|---|---|
-| Claude Code | `Read` でファイルパス読み込み | `python3` 直接実行 | Supabase MCP |
-| claude.ai (Skills) | 添付ファイル or 本文貼付 | code execution sandbox で `python` | Supabase MCP (チャット層) |
+| プラットフォーム | 入力方法 | スクリプト実行 | DB 操作 | ネットワーク |
+|---|---|---|---|---|
+| Claude Code | `Read` ツールでファイルパス読込 | `python3` 直接実行 | Supabase MCP (`execute_sql` 等) | 制約なし |
+| claude.ai (Skills) | 添付ファイルを sandbox の `open()` で読む / 本文貼付 | code execution sandbox の `python` | Supabase MCP (チャット層・ユーザー設定の connector 経由) | **既定で外部HTTP不可** (allowlist 制) |
 
 スクリプトは **すべて Python (標準ライブラリのみ)** で書かれており、両環境で同じコードが動く。シェルコマンド (`shasum` / `curl` 等) には依存しない。
+
+> **claude.ai 制約**: code execution sandbox は既定で外部 HTTP egress を許可しない。ステップ6 の Edge Function 直叩きは Supabase domain が allowlist に入っていない限り失敗する。**その場合は Supabase MCP (チャット層) 経由に切り替える** (本 SKILL.md に手順あり)。
 
 ## 入力の受付
 
 呼び出し時に以下のいずれかが提供される:
 
-- **(A) ファイルパス**: ローカルファイルを `Read` ツールで読む (Claude Code)
-- **(B) 添付ファイル**: claude.ai の attachment として渡される
+- **(A) Claude Code でファイルパス**: `Read` ツールでファイル読込
+- **(B) claude.ai で添付ファイル**: sandbox に展開済みのファイルを Python `open(path)` で読む
 - **(C) 直接テキスト**: 引数や直前の会話に本文が貼り付けられている
 
 どの場合も、**本文 (`content`) と "想定ファイル名 / タイトル候補"** を確保する。タイトル候補が不明なときは:
@@ -168,19 +170,28 @@ RETURNING id;
 
 `lib/chunk.py` (本スキル同梱の Python スクリプト) を使う。スキルルートからの相対パスは `lib/chunk.py`。
 
-**Claude Code の場合**:
+**Claude Code の場合** — リポジトリ内の絶対パスで実行:
 ```bash
-python3 .claude/skills/register-insight/lib/chunk.py < /tmp/body.md > /tmp/chunks.json
+python3 "$REPO_ROOT/.claude/skills/register-insight/lib/chunk.py" < /tmp/body.md > /tmp/chunks.json
 ```
 
-**claude.ai の場合** (sandbox の Python から直接 import):
+**claude.ai の場合** — sandbox cwd は skill 直下と限らない。`CLAUDE_SKILL_DIR` を優先し、なければファイル探索で fallback:
 ```python
-# スキル ZIP は sandbox に展開済み。lib/chunk.py が読める
-import sys
-sys.path.insert(0, "lib")
+import os, sys, glob, json
+
+skill_dir = os.environ.get("CLAUDE_SKILL_DIR")
+if not skill_dir or not os.path.isfile(os.path.join(skill_dir, "lib", "chunk.py")):
+    # fallback: sandbox 内を探す
+    matches = glob.glob("**/register-insight/lib/chunk.py", recursive=True) \
+              or glob.glob("**/lib/chunk.py", recursive=True)
+    if not matches:
+        raise RuntimeError("chunk.py が見つかりません — スキルが正しく展開されていない可能性")
+    skill_dir = os.path.dirname(os.path.dirname(matches[0]))
+
+sys.path.insert(0, os.path.join(skill_dir, "lib"))
 from chunk import chunk
+
 chunks = chunk(body_text)
-import json
 print(json.dumps(chunks, ensure_ascii=False))
 ```
 
@@ -240,8 +251,8 @@ SELECT
 `insight_done = true` かつ `chunks_pending = 0` で完了。
 
 タイムアウト (5分) しても未完なら:
-1. Edge Function ログ確認: `mcp__claude_ai_Supabase__get_logs(service="edge-function")`
-2. `scripts/backfill-embeddings.ts` で再実行可能な状態にする
+1. Edge Function ログ確認: Supabase MCP の `get_logs` ツール (`service="edge-function"`)。Claude Code では tool 名 `mcp__claude_ai_Supabase__get_logs`、claude.ai では connector が公開している同等ツール
+2. `scripts/backfill-embeddings.ts` で再実行可能な状態にする (Claude Code のみ)
 3. ユーザーに報告
 
 ---
@@ -249,6 +260,13 @@ SELECT
 ## ステップ 6: 検証 (サンプル検索 1 件)
 
 登録した内容に最も関連しそうなクエリ語 (2-1 で抽出したタグの 1 つや title の主要キーワード) を選び、自身の登録レコードがヒットするか確認。
+
+> **claude.ai の場合の制約**: code execution sandbox は既定で `*.supabase.co` への HTTP egress を許可しない (allowlist 制)。
+> - **対応 1 (推奨)**: Step 6 をスキップする。Step 5 で embedding 生成完了が確認できていれば、登録は成功している。
+> - **対応 2**: ユーザーに「サンプル検索を行いたい」と伝え、ユーザーが claude.ai で `*.supabase.co` を allowlist に追加した場合のみ実行
+> - **対応 3**: チャット層から Supabase MCP で `mcp__claude_ai_Supabase__execute_sql`(または connector が公開している同等ツール) を呼んで Edge Function を叩く方式は使えない (MCP は SQL 実行のみで HTTP は出せない)。Step 6 のサンプル検索は claude.ai では原則スキップが安全。
+>
+> **Claude Code の場合**: 制約なし。下記コードがそのまま動く。
 
 ```typescript
 // (a) クエリ embedding 生成 — Edge Function の query mode
@@ -267,7 +285,7 @@ const queryEmbedding = await fetch(
 
 簡便版として MCP `execute_sql` から `search_insights` を呼ぶ場合は、別途 query embedding を渡す必要があるため、**Edge Function を 1 回叩いて取得 → SQL に埋める** のが最短。
 
-両プラットフォーム共通の Python (urllib のみ・標準ライブラリ):
+両プラットフォーム共通の Python (urllib のみ・標準ライブラリ。claude.ai では sandbox の network allowlist が必要):
 
 ```python
 import json, os, urllib.request

@@ -5,14 +5,17 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SKILL_DIR="$REPO_ROOT/.claude/skills/register-insight"
+SKILL_PARENT="$REPO_ROOT/.claude/skills"
+SKILL_NAME="register-insight"
 OUT="$REPO_ROOT/dist/register-insight-claude-ai.zip"
 
 mkdir -p "$REPO_ROOT/dist"
 rm -f "$OUT"
 
-cd "$SKILL_DIR"
-zip -r "$OUT" SKILL.md lib/ -x "*.pyc" "**/__pycache__/*"
+# claude.ai expects the skill folder as ZIP root: register-insight/SKILL.md
+# (NOT bare SKILL.md at root)
+cd "$SKILL_PARENT"
+zip -r "$OUT" "$SKILL_NAME" -x "*.pyc" "**/__pycache__/*" "$SKILL_NAME/.*"
 
 echo "Built: $OUT"
 unzip -l "$OUT"
