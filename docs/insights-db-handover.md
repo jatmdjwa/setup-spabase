@@ -1,1006 +1,887 @@
-# Insights DB プロジェクト引き継ぎドキュメント
+# Insights DB プロジェクト引き継ぎドキュメント v4
 
-> **作成日**: 2026-05-03
-> **対象**: Claude Code での継続作業
-> **作成元**: [claude.ai](http://claude.ai) (Claude Opus 4.7) との対話履歴より
-
----
-
-## 0. このドキュメントの読み方
-
-本ドキュメントは、[claude.ai](http://claude.ai)での対話を通じて構築した「気づき・学び保存DB」の設計判断と現状のスキーマ、運用ルールを網羅的にまとめたものです。Claude Codeで作業を継続する際は、まず本ドキュメント全体を読んだ上で、関連するセクションを参照してください。
-
-**重要セクション(必読)**:
-- [2. プロジェクト基本情報](#2-プロジェクト基本情報) — Supabase接続情報
-- [3. 設計の前提と意思決定](#3-設計の前提と意思決定) — なぜこの設計になったか
-- [5. 現在のスキーマ詳細](#5-現在のスキーマ詳細) — テーブル構造の正確な仕様
-- [7. 運用ルール](#7-運用ルール) — 厳守事項
-- [10. 次のアクション](#10-次のアクション) — 未着手のタスク
+> **作成日**: 2026-05-03 (v4更新版)
+> **対象**: Claude Code での継続作業 / 改善タスク管理
+> **作成元**: claude.ai (Claude Opus 4.7) との対話履歴 + Claude Code セッション履歴より
+>
+> **v3からの変更点**:
+> - Tasks 2〜6 が Claude Code セッションで**完了** ✅
+> - Edge Function `generate-embedding` に **query mode** を追加 (検索用 embedding 生成)
+> - 新マイグレーション 2本追加 (`enable_pg_net_extension` + `add_embedding_trigger`) → 計14本
+> - Task 6 で発見した検索品質課題を §12 落とし穴に追記 (落とし穴10〜13)
+> - 残タスクは mkさん操作の **ChatGPT 接続テスト (Task 7) のみ**
 
 ---
 
-## 1. プロジェクト概要
+## 0. 最初に読むべきこと
 
-### 目的
+### このプロジェクトの目的
 
-複数のAIアプリ([Claude.ai](http://Claude.ai) / ChatGPT / Perplexity / Claude Desktop / Codex 等)から、MCP経由で共通利用できる**個人用の気づき・学び保存データベース**を Supabase 上に構築する。
+複数のAIアプリ(Claude.ai / ChatGPT / Perplexity / Claude Desktop / Codex 等)から、MCP経由で共通利用できる**個人用の気づき・学び保存DB**を Supabase 上に構築する。
 
-### 用途
+### Claude Codeで実施するタスク (現状)
 
-- 仕事のメモ・ナレッジ蓄積
-- 読書・学習の記録
-- 日々の内省ジャーナル
-- Deep Research結果の保存
-- 上記すべてを統合管理
+| # | タスク | 状態 | 備考 |
+|---|---|---|---|
+| ~~1~~ | ~~embedding カラム次元数変更 (1536 → 768)~~ | ✅ **完了済み** | claude.ai 側で実施 |
+| 2 | id=5 レコードの補正 (Deep Research本体保存) | ✅ **完了** | 2026-05-03 Claude Code |
+| 3 | Edge Function 実装 (embedding自動生成) | ✅ **完了** | document mode + query mode |
+| 4 | DBトリガー実装 (INSERT時にEdge Function呼出) | ✅ **完了** | pg_net + Vault |
+| 5 | バックフィル実行 (既存レコードへのembedding付与) | ✅ **完了** | insights 3件 + chunks 16件 |
+| 6 | 動作テスト (セマンティック検索が機能するか) | ✅ **完了** | 課題は §12 へ |
+| 7 | ChatGPT接続テスト準備 | 🔲 未実施 | mkさん操作待ち |
 
-### 利用形態
+### 将来の改善タスク (Claude Code で着手可)
 
-- **基本前提**: AI駆動利用 (AIが書き、AIが読む)
-- **想定アクセス元**: 複数AIアプリのMCPクライアント
-- **想定スケール**: 個人利用 (10年で~36,500件規模)
-- **検証〜本格運用**: 段階移行を想定
+| # | タスク | 優先度 | 関連 |
+|---|---|---|---|
+| A | **検索品質改善**: chunk長さ重み付け、ハイブリッド検索のOR化 | 中 | 落とし穴10, 11 |
+| B | **`insights_writer` ロールへの切替** (判断7のフェーズ2移行) | 中 | 判断7 |
+| C | **Routine併用** (朝のダイジェスト / 重複検出 / タグ整理) | 低 | 判断6 |
+| D | Edge Function に入力長 guard 追加 (~3,000〜4,000字でtruncate) | 低 | 落とし穴12 |
 
 ---
 
-## 2. プロジェクト基本情報
+## 1. プロジェクト基本情報
 
-### Supabase プロジェクト
+### Supabase
 
 | 項目 | 値 |
 |---|---|
-| **プロジェクト名** | chatDB |
-| **Project Ref / ID** | `gntgcxdbcbywfboejimz` |
-| **組織ID** | `hiiayixtpcazarfhpjyz` |
-| **リージョン** | `ap-southeast-1` (Singapore) |
-| **Postgres バージョン** | 17.6.1.111 |
-| **プラン** | Free |
-| **作成日** | 2026-05-02 |
-| **DB ホスト** | `[db.gntgcxdbcbywfboejimz.supabase.co](http://db.gntgcxdbcbywfboejimz.supabase.co)` |
-| **MCP Server URL** | `https://mcp.supabase.com/mcp?project_ref=gntgcxdbcbywfboejimz` |
+| プロジェクト名 | chatDB |
+| Project Ref / ID | `gntgcxdbcbywfboejimz` |
+| 組織ID | `hiiayixtpcazarfhpjyz` |
+| リージョン | `ap-southeast-1` (Singapore) |
+| Postgres バージョン | 17.6.1.111 |
+| プラン | Free |
+| MCP Server URL | `https://mcp.supabase.com/mcp?project_ref=gntgcxdbcbywfboejimz` |
 
-### 拡張機能
+### GCP (embedding用)
 
-- `vector` (pgvector) — セマンティック検索用
-- `pg_trgm` — 日本語含むキーワード検索高速化用
+| 項目 | 値 |
+|---|---|
+| プロジェクト | `insights-embedding` |
+| 有効化済みAPI | `aiplatform.googleapis.com` (画面上「Agent Platform API」と表示) |
+| サービスアカウント | `insights-embedding-sa@insights-embedding.iam.gserviceaccount.com` |
+| 付与ロール | `roles/aiplatform.user` (Vertex AI ユーザー) |
+| 使用モデル | `text-embedding-005` |
+| 次元数 | **768** (DB側設定済み) |
+| 推奨リージョン | `us-central1` |
+
+### Supabase Secrets (登録済み)
+
+| 名前 | 内容 |
+|---|---|
+| `GCP_SA_KEY` | サービスアカウントJSON全体 (改行含むJSON文字列) |
+| `GCP_PROJECT_ID` | `insights-embedding` ← **登録済み** |
+
+これらはSupabase Dashboard → Project Settings → Edge Functions → Secrets で確認可能。
 
 ---
 
-## 3. 設計の前提と意思決定
+## 2. 設計の前提と意思決定 (重要な経緯)
 
-### 3.1 機能要件 (ユーザー回答ベース)
+### 設計判断の概要
 
-| 質問 | 回答 |
-|---|---|
-| 用途 | 仕事メモ・読書・内省ジャーナル全部統合 |
-| 必要機能 | タグ分類、出典記録、重要度、関連付け |
-| 利用主体 | 基本AIから利用 (人が直接入力する想定は薄い) |
-| 連携先 | Claude / ChatGPT / Perplexity / Codex 等の複数AI |
-| 運用方針 | 検証用途だが継続使用想定。シンプル+最低限の制御 |
+#### 判断1: 単一テーブル + JSON配列に統一
+- AI駆動利用前提なので、INSERT 1回で完結する設計
+- タグは `TEXT[]` 配列、関連付けは embedding/Claude判定で代替
 
-### 3.2 設計上の重要な判断
-
-#### 判断1: 単一テーブル設計 vs 正規化
-
-**最終判断: 単一テーブル + JSON配列に統一**
-
-- AIが書き込み主体の場合、多対多正規化はINSERTで複数クエリ必要 = 重い
-- タグは `TEXT[]` 配列 + GINインデックスで十分
-- 関連付けは `embedding` のセマンティック検索で代替可能
-- 後でデータ量が増えてから正規化するのは容易
-
-#### 判断2: 原文保持 vs AI整形
-
-**最終判断: 原文と整形版を別カラムで分離**
-
-- `content`: ユーザーの原文 (不変・一次資料)
+#### 判断2: 原文と整形版を別カラムで分離
+- `content`: ユーザー原文 (不変・一次資料)
 - `content_normalized`: AI整形版 (検索精度向上用)
-- `ai_commentary`: AI解説 (価値ある時のみ付与)
-- `summary`: AIによる短い要約
+- `ai_commentary`: AI解説 (価値ある時のみ)
+- `summary`: 短い要約
 
-**経緯**: 当初は「contentにAIが整理して入れる」設計だったが、ユーザーから「自分が書いた言葉とAIの言葉が混ざる」と指摘され、4階層構造に分離。
+#### 判断3: 長文は3階層構造
+```
+insights → insight_documents (本体) → document_chunks (検索用)
+```
 
-#### 判断3: 長文への対応
+#### 判断4: Markdown を基本形式
+- AI出力は元々ほぼMarkdown
+- `content_format` カラムで明示
 
-**最終判断: 3階層構造 (insights → insight_documents → document_chunks)**
+#### 判断5: embedding は Google Vertex AI で生成
+- 検討経緯:
+  - Anthropicは embedding API を提供していない (公式)
+  - OpenAI と Google を比較: コスト・性能ともGoogleが優位 (Google: $0.006/M, OpenAI: $0.02/M)
+  - mkさんは既にGCPアカウント保有
+  - 日本語コンテンツが中心なので、多言語性能の高いGoogleが好適
+- **採用モデル**: `text-embedding-005` (768次元)
 
-| 文字数 | 格納先 |
-|---|---|
-| 〜100,000字 | `insights.content` のみ |
-| 100,000字超 | `insights.content`に要約 + `insight_documents.body` に全文 |
-| Deep Research等 | 上記 + `document_chunks` でチャンク分割 |
+#### 判断6: Edge Function でリアルタイム生成
+- INSERT/UPDATE トリガで Edge Function を呼ぶ
+- pg_net 拡張を使用
+- Claude Routine は別用途 (朝のダイジェスト等の判断処理) で活用予定
 
-**チャンク分割の役割**:
-- 各チャンクは原文の該当部分そのまま(改変なし)
-- 独立した embedding を持ちピンポイント検索可能
-- ChatGPTやClaudeから「この部分」を抽出する用途
+#### 判断7: セキュリティは段階的に強化
+- **検証フェーズ (現状)**: service_role 使用
+- **動作確認後 (将来)**: insights_writer ロールへ切り替え (改善タスクB)
 
-#### 判断4: AI解説の付与方針
+---
 
-**最終判断: AIが価値があると判断した時のみ付ける**
+## 3. 現在のスキーマ詳細
 
-- デフォルトはNULL
-- 「3つの段階を経た発想の転換」のような構造化や、関連知識の補強等、振り返りに役立つ場合に付与
-- `metadata.commentary_added_reason` に付与理由を記録
+### テーブル構成
 
-#### 判断5: 正規化の整形範囲
+```
+insights (id=1, 3, 5 が存在 / id=2, 4 は欠番)
+  ├─ insight_documents
+  │    ├─ id=1 (deep_research, 4 chunks for insight_id=1)
+  │    └─ id=2 (deep_research, 32,263字, 12 chunks for insight_id=5)  ← 新規
+  └─ document_chunks: 計16件 (4 + 12) すべて embedding 済み
+```
 
-**最終判断: 表記統一+誤字修正+文法修正まで含める**
+→ **全レコード embedding 済み (insights 3件 / chunks 16件)。**
 
-- 半角スペース除去、表記ゆれ統一
-- 明確な誤字修正、文法的におかしい箇所の修正
-- 意味の補完も限定的に許容(原文が残っているため)
-- ただし「読みにくい文章の再構成」は不可
-- `metadata.normalized_changes` に変更内容を記録
+### insights テーブル
 
-#### 判断6: テキスト形式
-
-**最終判断: Markdown を基本形式とする**
-
-- AI出力は元々ほぼMarkdown形式
-- プレーン化は情報損失
-- HTMLタグはノイズが多い
-- `content_format` カラムで明示 ('markdown' / 'plaintext' / 'html')
-
-#### 判断7: セキュリティと運用工数のバランス
-
-**最終判断: 最低限の整備で実用に耐える設定**
-
-| 項目 | 採用 | 理由 |
+| カラム | 型 | 重要事項 |
 |---|---|---|
-| RLS有効化 | ✅ | 万一のキー漏洩保護 |
-| 専用ロール `insights_writer` | ✅ | service_role直接利用回避 |
-| 入力バリデーション | ✅ | AI暴走時の品質担保 |
-| ソフト削除 | ✅ | AI誤操作対策 |
-| PITR | ❌ | $25/月、検証フェーズには過剰 |
-| 監査ログ | ❌ | 個人利用には過剰、source_appで十分 |
-| Edge Functions経由API | ❌ | 工数が大きい、MCP直接で簡素化 |
+| id | bigint | 主キー |
+| title | text | 空文字禁止、最大500字 |
+| content | text | **原文不変ルール**。空禁、最大100,000字 |
+| content_normalized | text | AI整形版。最大100,000字 |
+| ai_commentary | text | AI解説。最大10,000字 |
+| summary | text | 要約。最大1,000字 |
+| category | text | work/learning/journal/idea/question (自由) |
+| tags | text[] | 最大20個 |
+| importance | smallint | 1-5 (デフォルト3) |
+| confidence | smallint | 1-5 |
+| source_app | text | claude_ai/chatgpt/perplexity/claude_desktop/codex/manual |
+| source_model | text | |
+| source_type | text | conversation/book/article/meeting/experience |
+| source_title | text | |
+| source_url | text | |
+| original_prompt | text | |
+| session_ref | text | |
+| language | text | デフォルト 'ja' |
+| content_format | text | 'markdown'/'plaintext'/'html' |
+| **embedding** | **vector(768)** | ✅ 768次元、全レコード生成済み |
+| embedding_model | text | 'text-embedding-005' を記録 |
+| metadata | jsonb | デフォルト '{}' |
+| is_archived | boolean | デフォルト false (ソフト削除) |
+| created_at | timestamptz | |
+| updated_at | timestamptz | トリガで自動更新 |
 
----
+### insight_documents テーブル
 
-## 4. データベース構造概観
-
-### 全体構造
-
-```
-insights (気づき・学びのメタ情報・本体)
-  ├─ insight_documents (長文ドキュメント本体・原文不変)
-  │    └─ document_chunks (検索用チャンク・原文の該当部分そのまま)
-  ↑
-  最大100,000字までは insights.content だけで完結
-```
-
-### テーブル一覧
-
-| テーブル | 行数(現時点) | 役割 |
+| カラム | 型 | 備考 |
 |---|---|---|
-| `insights` | 2 | 気づき・学びの本体テーブル(メタ情報・要約・タグ等) |
-| `insight_documents` | 1 | 長文ドキュメント格納(Deep Research/書籍/トランスクリプト等) |
-| `document_chunks` | 4 | 長文を意味的単位で分割したチャンク(検索用) |
+| id | bigint | |
+| insight_id | bigint | FK → insights.id (CASCADE) |
+| doc_type | text | fulltext/deep_research/transcript/reference/other |
+| title | text | |
+| body | text | **原文不変**。空禁、最大1,000,000字 |
+| source_app/source_model/source_url | text | |
+| content_format | text | デフォルト 'markdown' |
+| metadata | jsonb | |
+| created_at/updated_at | timestamptz | |
+
+### document_chunks テーブル
+
+| カラム | 型 | 備考 |
+|---|---|---|
+| id | bigint | |
+| document_id | bigint | FK → insight_documents.id (CASCADE) |
+| chunk_index | int | 0始まり、 < chunk_total |
+| chunk_total | int | |
+| body | text | **親ドキュメントの該当部分そのまま**。最大5,000字 |
+| section_title | text | |
+| section_path | text[] | |
+| **embedding** | **vector(768)** | ✅ 768次元、全16件生成済み |
+| embedding_model | text | |
+| metadata | jsonb | |
+| created_at | timestamptz | |
+
+UNIQUE: (document_id, chunk_index)
 
 ---
 
-## 5. 現在のスキーマ詳細
+## 4. 既存の関数・ビュー一覧
 
-### 5.1 `insights` テーブル
+| 名前 | 種別 | 用途 |
+|---|---|---|
+| `update_updated_at()` | トリガ関数 | updated_at自動更新 |
+| `search_insights(...)` | 関数 | 統合検索 (引数 query_embedding は VECTOR(768)) |
+| `search_chunks(...)` | 関数 | チャンク単位の検索 (VECTOR(768)) |
+| `get_document_with_chunks(p_document_id)` | 関数 | ドキュメント全文取得 |
+| `replace_document_chunks(p_document_id, p_chunks)` | 関数 | チャンク全置換登録 (VECTOR(768)) |
+| `list_recent_insights(...)` | 関数 | 軽量な最近一覧 |
+| `get_insights_stats()` | 関数 | カテゴリ/タグ/期間別統計 |
+| `trigger_generate_embedding_insights()` | トリガ関数 | insights INSERT/UPDATE 時に Edge Function を非同期呼出 |
+| `trigger_generate_embedding_chunks()` | トリガ関数 | document_chunks INSERT/UPDATE 時に Edge Function を非同期呼出 |
+| `insights_list_view` | ビュー | 一覧表示用軽量ビュー |
 
-**用途**: 気づき・学びの本体。メタ情報と本文を保持。
+### Edge Function: `generate-embedding`
 
-| カラム | 型 | NULL | デフォルト | 制約・説明 |
-|---|---|---|---|---|
-| `id` | bigint | NO | sequence | 主キー |
-| `title` | text | NO | - | 1行タイトル(空文字禁止、最大500字) |
-| `content` | text | NO | - | 本文(空文字禁止、最大100,000字)。**原文不変** |
-| `content_normalized` | text | YES | - | AI整形版(最大100,000字)、検索精度向上用 |
-| `ai_commentary` | text | YES | - | AI解説(最大10,000字)、価値ある時のみ |
-| `summary` | text | YES | - | AI要約(最大1,000字) |
-| `category` | text | YES | - | 大分類(例: work / learning / journal / idea / question) |
-| `tags` | text[] | NO | `{}` | タグ配列(最大20個) |
-| `importance` | smallint | NO | 3 | 重要度 1-5 |
-| `confidence` | smallint | YES | - | 確信度 1-5 (1=仮説, 5=確信) |
-| `source_app` | text | YES | - | 保存元: claude_ai / chatgpt / perplexity / claude_desktop / codex / manual |
-| `source_model` | text | YES | - | AIモデル名 |
-| `source_type` | text | YES | - | 出典種別: conversation / book / article / meeting / experience |
-| `source_title` | text | YES | - | 出典タイトル |
-| `source_url` | text | YES | - | 出典URL |
-| `original_prompt` | text | YES | - | 気づきが生まれた元プロンプト |
-| `session_ref` | text | YES | - | チャットセッション参照(ID/URL) |
-| `language` | text | NO | `ja` | 言語コード |
-| `content_format` | text | NO | `markdown` | 'markdown' / 'plaintext' / 'html' |
-| `embedding` | vector(1536) | YES | - | セマンティック検索用ベクトル |
-| `embedding_model` | text | YES | - | 埋め込みモデル名 |
-| `metadata` | jsonb | NO | `{}` | AI拡張領域 |
-| `is_archived` | boolean | NO | false | ソフト削除フラグ |
-| `created_at` | timestamptz | NO | now() | - |
-| `updated_at` | timestamptz | NO | now() | トリガで自動更新 |
+**document mode と query mode の両対応** (Task 6 で query mode を追加)。
 
-**インデックス**:
-- HNSW: `embedding` (ベクトル検索)
-- GIN trgm: `title`, `content`, `content_normalized`, `ai_commentary`, `summary` (キーワード検索)
-- GIN: `tags`, `metadata` (配列・JSONB検索)
-- B-tree (部分): `category`, `source_app`, `importance DESC`, `created_at DESC` (※ `is_archived = FALSE` の条件付き)
+| mode | 入力 | 動作 |
+|---|---|---|
+| `document` (デフォルト) | `{table, id, text, task_type?}` | 768-dim embedding を生成し、該当レコードを UPDATE。`task_type` のデフォルトは `RETRIEVAL_DOCUMENT` |
+| `query` | `{mode: "query", text, task_type?}` | 768-dim embedding を返すのみ (DB書込なし)。`task_type` のデフォルトは `RETRIEVAL_QUERY` |
 
-### 5.2 `insight_documents` テーブル
-
-**用途**: Deep Research等の長文ドキュメント本体格納。1 insight に 0..N 個関連付け。
-
-| カラム | 型 | NULL | デフォルト | 制約・説明 |
-|---|---|---|---|---|
-| `id` | bigint | NO | sequence | 主キー |
-| `insight_id` | bigint | NO | - | FK → [insights.id](http://insights.id) (CASCADE削除) |
-| `doc_type` | text | NO | `fulltext` | 種別: fulltext / deep_research / transcript / reference / other |
-| `title` | text | YES | - | ドキュメントタイトル |
-| `body` | text | NO | - | 本文(空文字禁止、最大1,000,000字)。**原文不変** |
-| `source_app` | text | YES | - | - |
-| `source_model` | text | YES | - | - |
-| `source_url` | text | YES | - | - |
-| `content_format` | text | NO | `markdown` | - |
-| `metadata` | jsonb | NO | `{}` | - |
-| `created_at` | timestamptz | NO | now() | - |
-| `updated_at` | timestamptz | NO | now() | - |
-
-**インデックス**:
-- B-tree: `insight_id`, `doc_type`
-- GIN trgm: `body`
-
-### 5.3 `document_chunks` テーブル
-
-**用途**: 長文を意味的単位で分割。各チャンクが独立したembeddingを持ちピンポイント検索可能。
-
-| カラム | 型 | NULL | デフォルト | 制約・説明 |
-|---|---|---|---|---|
-| `id` | bigint | NO | sequence | 主キー |
-| `document_id` | bigint | NO | - | FK → insight_[documents.id](http://documents.id) (CASCADE削除) |
-| `chunk_index` | int | NO | - | 順序(0始まり、`< chunk_total`) |
-| `chunk_total` | int | NO | - | 総チャンク数 |
-| `body` | text | NO | - | 本文(空文字禁止、最大5,000字)。**親ドキュメントの該当部分そのまま** |
-| `section_title` | text | YES | - | 章・節タイトル |
-| `section_path` | text[] | YES | - | 階層パス(例: `['第2部','第5章']`) |
-| `embedding` | vector(1536) | YES | - | チャンクごとのembedding |
-| `embedding_model` | text | YES | - | - |
-| `metadata` | jsonb | NO | `{}` | - |
-| `created_at` | timestamptz | NO | now() | - |
-
-**ユニーク制約**: `(document_id, chunk_index)`
-
-**インデックス**:
-- B-tree: `(document_id, chunk_index)`
-- HNSW: `embedding`
-- GIN trgm: `body`
-- B-tree (部分): `section_title` (NOT NULL条件)
+`mode: "query"` を使うことで、検索クエリ側の embedding 生成を Edge Function 経由で統一できる。
 
 ---
 
-## 6. 関数・ビュー一覧
+## 5. 運用ルール (厳守事項)
 
-### 6.1 検索関数
+### 原文不変
+- `insights.content`: ユーザー入力をそのまま保存。AIによる加筆・整形・要約・誤字修正・文法修正は禁止
+- `insight_documents.body`: 原文ママ
+- `document_chunks.body`: 親ドキュメントの該当部分をそのまま切り出し
 
-#### `search_insights()` — 統合検索
-
-```sql
-search_insights(
-  query_text         TEXT          DEFAULT NULL,
-  query_embedding    VECTOR(1536)  DEFAULT NULL,
-  filter_category    TEXT          DEFAULT NULL,
-  filter_tags        TEXT[]        DEFAULT NULL,
-  filter_source_app  TEXT          DEFAULT NULL,
-  min_importance     SMALLINT      DEFAULT NULL,
-  match_count        INT           DEFAULT 10
-) RETURNS TABLE(...)
-```
-
-- キーワード/ベクトル/フィルタを任意組み合わせ
-- 検索対象: `title` + `content` + `content_normalized` + `ai_commentary` + `summary`
-- ベクトル指定時はベクトル類似度優先、ない場合はテキストランクで並び替え
-
-#### `search_chunks()` — チャンク検索
-
-```sql
-search_chunks(
-  query_text          TEXT          DEFAULT NULL,
-  query_embedding     VECTOR(1536)  DEFAULT NULL,
-  filter_document_id  BIGINT        DEFAULT NULL,
-  filter_insight_id   BIGINT        DEFAULT NULL,
-  match_count         INT           DEFAULT 10
-) RETURNS TABLE(...)
-```
-
-- 長文の中の特定段落だけをピンポイントで取得
-
-#### `get_document_with_chunks()` — ドキュメント全文取得
-
-```sql
-get_document_with_chunks(
-  p_document_id BIGINT
-) RETURNS TABLE(...)
-```
-
-- 指定ドキュメントの全チャンクを `chunk_index` 順で取得
-- 検索ヒット箇所の前後文脈を辿る用途
-
-### 6.2 一覧・集計関数
-
-#### `list_recent_insights()` — 最近の気づき一覧
-
-```sql
-list_recent_insights(
-  days_back        INT      DEFAULT NULL,
-  match_count      INT      DEFAULT 50,
-  filter_category  TEXT     DEFAULT NULL,
-  filter_tags      TEXT[]   DEFAULT NULL,
-  min_importance   SMALLINT DEFAULT NULL,
-  order_by         TEXT     DEFAULT 'recent'  -- 'recent' | 'importance'
-) RETURNS TABLE(...)
-```
-
-- 期間・カテゴリ・タグ等で絞り込み
-- 軽量(content_previewのみ、長文カラム除外)
-
-#### `get_insights_stats()` — 統計情報
-
-```sql
-get_insights_stats() RETURNS TABLE(
-  metric_type TEXT,
-  metric_key  TEXT,
-  count       BIGINT
-)
-```
-
-- カテゴリ別、アプリ別、重要度別、タグ別、期間別の件数を一括取得
-
-### 6.3 チャンク管理関数
-
-#### `replace_document_chunks()` — チャンク全置換登録
-
-```sql
-replace_document_chunks(
-  p_document_id BIGINT,
-  p_chunks      JSONB
-) RETURNS TABLE(inserted_count INT)
-```
-
-JSONB配列フォーマット例:
-```json
-[
-  {
-    "body": "チャンク本文...",
-    "section_title": "序論",
-    "section_path": ["第1部", "序論"],
-    "embedding": [0.1, 0.2, ...],
-    "embedding_model": "text-embedding-3-small",
-    "metadata": {}
-  }
-]
-```
-
-- 既存チャンクは削除され全置換
-- `chunk_index` は0始まりで自動採番、`chunk_total` は配列長で自動設定
-
-### 6.4 ビュー
-
-#### `insights_list_view`
-
-- 一覧表示用の軽量ビュー
-- 長文カラム(`content`/`ai_commentary`等)を除外
-- `content_preview` (先頭200字) と `content_length` を提供
-- `has_ai_commentary` フラグ、`document_count` も付与
-- アーカイブ済みは自動除外
-
-### 6.5 トリガ関数
-
-#### `update_updated_at()`
-
-- `insights` と `insight_documents` の `updated_at` を自動更新
-
----
-
-## 7. 運用ルール
-
-### 7.1 厳守事項 (AIが操作する際のルール)
-
-#### ルール1: 原文不変
-
-| カラム | ルール |
-|---|---|
-| `insights.content` | ユーザー入力をそのまま保存。AIによる加筆・整形・要約・誤字修正・文法修正は禁止 |
-| `insight_documents.body` | 原文ママ保存。改変禁止 |
-| `document_chunks.body` | 親ドキュメントの該当部分をそのまま切り出す。改変禁止 |
-
-#### ルール2: 整形・解説の保存先
-
+### 整形・解説の保存先
 - 整形版 → `content_normalized`
-- 解説 → `ai_commentary` (価値がある時のみ)
+- 解説 → `ai_commentary` (AIが価値あると判断した時のみ)
 - 要約 → `summary`
 - 自由メタ → `metadata`
 
-#### ルール3: 物理削除の回避
-
+### 物理削除の回避
 - DELETEは原則使わず `is_archived = TRUE` でソフト削除
-- データを蓄積資産として永続化
 
-#### ルール4: 文字数による振り分け
-
-| 文字数 | 格納先 |
-|---|---|
-| 〜100,000字 | `insights.content` のみ |
-| 100,000字超 | `insights.content` に要約 + `insight_documents.body` に全文 |
-| Deep Research等 | 上記 + チャンク分割 |
-
-#### ルール5: 必須メタ情報
-
-INSERT時には以下を可能な限り埋める:
+### 必須メタ情報
 - `source_app` (どのAIから保存されたか)
 - `content_format` ('markdown' が基本)
 - `language` ('ja' が基本)
 
-### 7.2 入力バリデーション (DB制約として実装済み)
-
-| 項目 | 制約 |
-|---|---|
-| `insights.title` | 空文字禁止、最大500字 |
-| `insights.content` | 空文字禁止、最大100,000字 |
-| `insights.summary` | 最大1,000字 |
-| `insights.content_normalized` | 最大100,000字 |
-| `[insights.ai](http://insights.ai)_commentary` | 最大10,000字 |
-| `insights.tags` | 最大20個 |
-| `insights.importance` | 1-5 |
-| `insights.confidence` | 1-5 |
-| `insights.content_format` | 'markdown' / 'plaintext' / 'html' のみ |
-| `insight_documents.body` | 空文字禁止、最大1,000,000字 |
-| `document_chunks.body` | 空文字禁止、最大5,000字 |
-| `document_chunks.chunk_index` | 0以上、`chunk_total` 未満 |
-
-### 7.3 RLS設定
-
-| ロール | アクセス | 用途 |
-|---|---|---|
-| `service_role` | フルアクセス | 現状のMCP接続 |
-| `insights_writer` | フルアクセス (insightsスキーマ内のみ) | 将来の制限付きキー運用 |
-| `authenticated` | 拒否 | (未使用) |
-| `anon` | 拒否 | (未使用) |
-
-### 7.4 セキュリティ運用方針
-
-**段階的アプローチ**:
-1. **現在(検証フェーズ)**: `service_role` キーを各MCPクライアントに配布
-2. **動作確認後**: `insights_writer` ロール用のJWTに切り替え
-3. **将来**: 必要に応じてSupabase Auth + 細粒度RLSポリシー
-
-**注意**: `insights_writer` ロール用のJWT発行は、Supabase Dashboard上での手動操作が必要(SQLからJWT secretは取得できない)。
+### embedding 生成ルール
+- **対象**: `insights.content_normalized` (NULLなら `content`) を使用
+- **document_chunks**: `body` を使用
+- **モデル**: text-embedding-005 (768次元)
+- **task_type**: RETRIEVAL_DOCUMENT (保存時) / RETRIEVAL_QUERY (検索時)
+- **embedding_model カラム**: 'text-embedding-005' を必ず記録
 
 ---
 
-## 8. マイグレーション履歴
+## 6. 既存データの状況 (2026-05-03 時点)
 
-時系列で適用したマイグレーション(全11本):
+### insights テーブル (3件、全件 embedding 済み)
 
-| # | バージョン | 名称 | 概要 |
+| id | title | source_app | importance | embedding |
+|---|---|---|---|---|
+| 1 | AI駆動DBは単一テーブル+JSON配列でシンプルに保つべき | claude_ai | 4 | ✅ |
+| 3 | AIとデータの分離による「マルチAI対応データ基盤」という新しい構造 | claude_ai | 5 | ✅ |
+| 5 | 空港DXを加速させるマルチエージェントシステムの戦略的実装 | codex | 3 | ✅ (補正済) |
+
+### insight_documents テーブル (2件)
+
+| id | insight_id | doc_type | body 長 | chunks |
+|---|---|---|---|---|
+| 1 | 1 | deep_research | (既存) | 4 |
+| 2 | 5 | deep_research | **32,263字** | **12** |
+
+### document_chunks テーブル (16件、全件 embedding 済み)
+
+- document_id=1 → 4 chunks
+- document_id=2 → 12 chunks (preamble + 第1〜6章 + 第7章を5パートに分割)
+
+### id=5 の課題 — **解決済み (2026-05-03 Claude Code セッション)**
+
+> 履歴として残す。再構築時のリファレンス価値あり。
+
+**経緯**: mkさんが Gemini Web の Deep Research で生成したレポートを、Claude.ai 上で **Haikuモデル**を介して保存テストした際、保存処理が**途中で完了したことになっていた**。実態:
+
+| 項目 | 想定 | 実態 (補正前) | 補正後 |
 |---|---|---|---|
-| 1 | 20260502134820 | `create_insights_schema` | 初期スキーマ(insights/tags/insight_tags/insight_relations) |
-| 2 | 20260502135223 | `extend_insights_for_multi_ai_integration` | pgvector追加、マルチAI連携用カラム追加 |
-| 3 | 20260502135247 | `setup_rls_policies_personal_use` | RLS設定 |
-| 4 | 20260502135849 | `reset_and_rebuild_ai_driven_schema` | **AI駆動前提に大規模再設計**(単一テーブル化) |
-| 5 | 20260502140236 | `harden_operations_minimal` | 専用ロール `insights_writer` 作成、バリデーション制約 |
-| 6 | 20260502140945 | `add_long_documents_support` | `insight_documents` テーブル追加、content上限拡大 |
-| 7 | 20260502142425 | `clarify_content_verbatim_rule` | 原文不変ルールをスキーマコメントで明示 |
-| 8 | 20260502143332 | `add_normalized_and_commentary_columns` | `content_normalized`, `ai_commentary` カラム追加 |
-| 9 | 20260502144435 | `add_document_chunks_for_long_text` | `document_chunks` テーブル追加 |
-| 10 | 20260502144511 | `add_chunk_management_functions` | チャンク管理・検索関数追加 |
-| 11 | 20260502144920 | `add_format_listing_and_stats` | content_format、一覧ビュー、統計関数追加 |
+| insights への要約保存 | ✅ 必要 | ✅ 339字保存済み | ✅ |
+| insight_documents への全文保存 | ✅ 必要 | ❌ 未保存 | ✅ **32,263字保存** |
+| document_chunks への章別チャンク保存 | ✅ 必要 (約7章) | ❌ 未保存 | ✅ **12 chunks** |
+
+**文字数の補足**: 元 metadata の `char_count: 150892` は誤値。実体は **32,267字** (DB body は 32,263字、4字差は `\_` 等のエスケープ正規化由来)。Haiku セッション時の文字数推定に過大な誤差があったと判断される。
+
+**元データ**: mkさん手元に保管済み (再現可能)
 
 ---
 
-## 9. AI駆動利用の典型パターン
+## 7. Claude Code で実施したタスク (履歴・リファレンス)
 
-### 9.1 短い気づきの保存
+> 全タスク完了済み。以下は**再構築時の参照用**として残す。
 
+### タスク2: id=5 レコードの補正 — ✅ 完了 (2026-05-03)
+
+#### 概要
+mkさんが手元に保管している Gemini Deep Research の元データ (Markdown形式) を、id=5 レコードに正しく紐付けて保存。
+
+#### 手順 (実施済み)
+
+**Step 2-1: 既存レコードの確認**
 ```sql
-INSERT INTO insights (
-  title, content, summary, category, tags,
-  importance, confidence,
-  source_app, source_model, source_type,
-  language, content_format, metadata
-) VALUES (
-  '<タイトル>',
-  '<原文そのまま>',
-  '<要約>',
-  'learning',
-  ARRAY['タグ1', 'タグ2'],
-  4, 4,
-  'chatgpt', 'gpt-5', 'conversation',
-  'ja', 'markdown',
-  '{}'::jsonb
-);
+SELECT id, title, source_app, source_model, source_type, tags, metadata
+FROM insights WHERE id = 5;
 ```
 
-### 9.2 Deep Research結果の保存
-
+**Step 2-2: 不足メタ情報の補正**
 ```sql
--- Step 1: メタ情報をinsightsに保存(要約のみ)
-WITH new_insight AS (
-  INSERT INTO insights (
-    title, content, summary, category, tags,
-    importance, source_app, source_type, content_format
-  ) VALUES (
-    '<調査タイトル>',
-    '【Deep Research結果のため要約のみ。全文はinsight_documentsに格納】<要約2000字程度>',
-    '<さらに短い要約>',
-    'learning',
-    ARRAY['research', 'タグ'],
-    5, 'chatgpt', 'conversation', 'markdown'
+UPDATE insights
+SET
+  source_model = 'gemini-deep-research',
+  source_type  = 'research_report',
+  tags         = ARRAY['空港DX', 'マルチエージェント', 'AI', 'Gemini', 'Deep Research', 'MAGS', 'A2Aプロトコル'],
+  metadata     = metadata || jsonb_build_object(
+    'original_source', 'gemini_web_deep_research',
+    'haiku_save_incomplete', true,
+    'corrected_at', NOW()::text,
+    'corrected_by', 'claude_code'
   )
-  RETURNING id
-),
--- Step 2: 全文をinsight_documentsに格納
-new_doc AS (
-  INSERT INTO insight_documents (
-    insight_id, doc_type, title, body, content_format
+WHERE id = 5;
+```
+
+**Step 2-3: insight_documents に全文を保存**
+```sql
+INSERT INTO insight_documents (
+  insight_id, doc_type, title, body, source_app, content_format, metadata
+) VALUES (
+  5,
+  'deep_research',
+  '空港DXを加速させるマルチエージェントシステムの戦略的実装と高度活用シナリオに関する包括的分析',
+  $body_text,
+  'gemini',
+  'markdown',
+  jsonb_build_object(
+    'source_origin', 'gemini_web_deep_research',
+    'imported_via', 'claude_code',
+    'char_count', LENGTH($body_text)
   )
-  SELECT id, 'deep_research', '<タイトル>', '<全文>', 'markdown'
-  FROM new_insight
-  RETURNING id
 )
--- Step 3: チャンク登録
+RETURNING id;
+-- 実際: id=2 が返った
+```
+
+**Step 2-4: 章別チャンク分割**
+
+下のSQL/擬似コードはサンプル。**実際のチャンク分割は Python での H2/H3 ベースのアルゴリズムで行った** (preamble + 7章 + 第7章を5パートに分割で計12チャンク)。
+
+```typescript
+// 擬似コード (リファレンス)
+function splitIntoChunks(markdown: string): Chunk[] {
+  // # / ## で大章を分割
+  // 5,000字超の章は段落・節単位でさらに分割
+  // 各 chunk: { body, section_title, section_path, metadata }
+  return [];
+}
+```
+
+**Step 2-5: replace_document_chunks() でチャンク登録**
+```sql
 SELECT replace_document_chunks(
-  (SELECT id FROM new_doc),
+  2,  -- 新document_id
   '[
-    {"body": "...", "section_title": "序論", "section_path": ["序論"]},
-    {"body": "...", "section_title": "本論1", "section_path": ["本論", "1"]}
+    {"body": "...", "section_title": "preamble", "section_path": []},
+    {"body": "...", "section_title": "第1章 序論", "section_path": ["第1章 序論"]},
+    ...
   ]'::jsonb
 );
 ```
 
-### 9.3 検索・取得パターン
+**Step 2-6: 検証** (実行済み・OK)
+
+---
+
+### タスク3: Edge Function 実装 — ✅ 完了 (2026-05-03)
+
+#### 仕様 (実装版)
+
+**Function名**: `generate-embedding`
+
+**役割**:
+- document mode: 対象テーブル・ID・テキストを受け取り、Vertex AI で embedding 生成 → 該当レコードを UPDATE
+- query mode: テキストを受け取り、embedding を返すのみ (DB書込なし)
+
+**入力 (document mode)**:
+```json
+{
+  "table": "insights" | "document_chunks",
+  "id": 123,
+  "text": "embedding対象テキスト",
+  "task_type": "RETRIEVAL_DOCUMENT"
+}
+```
+
+**入力 (query mode)**:
+```json
+{
+  "mode": "query",
+  "text": "検索クエリテキスト",
+  "task_type": "RETRIEVAL_QUERY"
+}
+```
+
+**出力 (document mode)**:
+```json
+{ "success": true, "embedding_dimensions": 768 }
+```
+
+**出力 (query mode)**:
+```json
+{ "success": true, "embedding": [0.1, 0.2, ...], "embedding_dimensions": 768 }
+```
+
+#### 認証
+
+`GCP_SA_KEY` から Service Account JSON をパース。SA の `private_key` で JWT(RS256) 署名 → OAuth2 token endpoint で access_token 取得 → Vertex AI 呼び出し。
+
+```typescript
+const SA = JSON.parse(Deno.env.get("GCP_SA_KEY")!);
+
+async function getAccessToken(): Promise<string> {
+  // header: { alg: 'RS256', typ: 'JWT' }
+  // payload: { iss: SA.client_email, scope, aud: 'https://oauth2.googleapis.com/token', exp, iat }
+  // crypto.subtle.importKey + sign で RS256 署名
+  // POST https://oauth2.googleapis.com/token
+}
+
+async function generateEmbedding(text: string, taskType: string): Promise<number[]> {
+  const token = await getAccessToken();
+  const projectId = Deno.env.get("GCP_PROJECT_ID")!;
+  const url = `https://us-central1-aiplatform.googleapis.com/v1/projects/${projectId}/locations/us-central1/publishers/google/models/text-embedding-005:predict`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ instances: [{ content: text, task_type: taskType }] })
+  });
+  const data = await res.json();
+  return data.predictions[0].embeddings.values; // 768
+}
+```
+
+---
+
+### タスク4: DBトリガー実装 — ✅ 完了 (2026-05-03)
+
+#### pg_net 拡張の有効化
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_net;
+```
+
+#### service_role key を Vault に保存
+```sql
+SELECT vault.create_secret(
+  '<service_role_key>',
+  'service_role_key',
+  'Used by DB triggers to call Edge Functions'
+);
+```
+
+#### insights 用トリガー
+```sql
+CREATE OR REPLACE FUNCTION trigger_generate_embedding_insights()
+RETURNS TRIGGER AS $$
+DECLARE
+  text_to_embed TEXT;
+  request_id BIGINT;
+  service_key TEXT;
+BEGIN
+  text_to_embed := COALESCE(NEW.content_normalized, NEW.content);
+
+  IF (TG_OP = 'INSERT') OR
+     (OLD.content IS DISTINCT FROM NEW.content) OR
+     (OLD.content_normalized IS DISTINCT FROM NEW.content_normalized) THEN
+
+    SELECT decrypted_secret INTO service_key
+    FROM vault.decrypted_secrets WHERE name = 'service_role_key';
+
+    SELECT net.http_post(
+      url := 'https://gntgcxdbcbywfboejimz.supabase.co/functions/v1/generate-embedding',
+      headers := jsonb_build_object(
+        'Content-Type', 'application/json',
+        'Authorization', 'Bearer ' || service_key
+      ),
+      body := jsonb_build_object(
+        'table', 'insights',
+        'id', NEW.id,
+        'text', text_to_embed,
+        'task_type', 'RETRIEVAL_DOCUMENT'
+      )
+    ) INTO request_id;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER trg_insights_generate_embedding
+  AFTER INSERT OR UPDATE OF content, content_normalized ON insights
+  FOR EACH ROW
+  EXECUTE FUNCTION trigger_generate_embedding_insights();
+```
+
+#### document_chunks 用トリガー
+同様に `body` カラム変更を検知して呼ぶ (`trigger_generate_embedding_chunks`)。
+
+---
+
+### タスク5: バックフィル — ✅ 完了 (2026-05-03)
+
+既存の id=1, 3, 5 (insights) と全 16 chunks に対して、Edge Function 経由で embedding を生成。
+
+```typescript
+const { data: insights } = await supabase
+  .from('insights')
+  .select('id, content, content_normalized')
+  .is('embedding', null);
+
+for (const row of insights ?? []) {
+  const text = row.content_normalized ?? row.content;
+  await fetch(`${SUPABASE_URL}/functions/v1/generate-embedding`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      table: 'insights', id: row.id, text, task_type: 'RETRIEVAL_DOCUMENT'
+    })
+  });
+  // レート制限考慮で適宜スリープ
+}
+```
+
+結果: insights 3件 + chunks 16件 全件 embedded。
+
+---
+
+### タスク6: 動作テスト — ✅ 完了 (2026-05-03)
+
+#### 検証SQL
+```sql
+-- embedding 生成状況
+SELECT id, title, (embedding IS NOT NULL) AS has_embedding, embedding_model
+FROM insights ORDER BY id;
+
+SELECT chunk_index, section_title, (embedding IS NOT NULL) AS has_embedding
+FROM document_chunks ORDER BY document_id, chunk_index;
+
+-- セマンティック検索: query mode で embedding 化 → search_chunks へ
+```
+
+#### 発見した課題
+検索品質に関して以下を発見 → §12 落とし穴10〜13 として追記:
+- 短いチャンクが抽象的なクエリで人為的に高スコアを示す
+- `search_insights` のハイブリッド AND 動作で取りこぼし
+- 入力長と pg_net 非同期ラグの注意点
+
+---
+
+## 8. 重要な教訓 (今回のテストから学んだこと)
+
+### 教訓1: モデル選択の重要性
+
+| モデル | 適性 | 理由 |
+|---|---|---|
+| Haiku | ❌ 不向き | 多段階処理を完遂しきれない、「準備完了」と誤認識して終わる傾向 |
+| Sonnet | ⚪ 適している | 多くの作業に対応可能 |
+| Opus | ◎ 推奨 | 複雑な処理・推論・大量データ処理 |
+| Claude Code (Sonnet/Opus) | ◎ 最適 | ファイル操作・段階的検証で確実性高い |
+
+**ルール**: 多段階で複雑な保存処理は **Sonnet 以上**を選択する。
+
+### 教訓2: 「保存準備完了」と「実際に保存された」は別
+
+AIが「✅ 保存完了」と言っても、実際にはINSERTが実行されていないことがある。**必ず以下で検証**:
 
 ```sql
--- 最近の学び一覧
-SELECT * FROM list_recent_insights(days_back => 30);
+SELECT COUNT(*) FROM <table>;
 
--- 重要度4以上で絞り込み
-SELECT * FROM list_recent_insights(
-  min_importance => 4::smallint,
-  order_by => 'importance'
+SELECT i.id, COUNT(d.id) AS doc_count
+FROM insights i
+LEFT JOIN insight_documents d ON d.insight_id = i.id
+GROUP BY i.id;
+```
+
+### 教訓3: AI保存品質のばらつき
+
+ChatGPT/Codex等から保存する際、AIによって以下のばらつきが発生する:
+- タグ付与の有無
+- メタ情報(source_model 等)の記録の有無
+- 3階層構造の正しい使い分け
+- 全文と要約の混同
+
+**対策**:
+- スキーマコメントを明確にする (済)
+- AIに渡すプロンプトテンプレートを整備 (このドキュメントの「9. ChatGPT接続設定」参照)
+- 定期的なデータ品質チェック(get_insights_stats等で異常検知)
+
+### 教訓4: 元データは必ず手元に保管
+
+AI経由の保存で失敗した場合、元データがあれば再保存できる。**手元保管は必須**。
+
+---
+
+## 9. ChatGPT接続設定 (mkさん操作 — Task 7)
+
+### 接続URL
+```
+https://mcp.supabase.com/mcp?project_ref=gntgcxdbcbywfboejimz&read_only=false&features=database,docs
+```
+
+### 設定手順
+1. ChatGPT → 設定 → コネクタ → 詳細設定 → Developer Mode を ON
+2. コネクタ → カスタムコネクタ作成
+3. 上記URLを MCP Server URL に設定
+4. OAuth認証でSupabaseログイン
+5. チャット画面で More → Developer Mode 有効化
+
+### 推奨プロンプト (Deep Research保存時)
+
+```
+SupabaseのMCP経由で、以下のDeep Research結果をDBに保存してください。
+
+【保存先DB構造】
+- insights: メタ情報と要約 (必須、全レコード)
+- insight_documents: 全文を原文ママ保存 (必須、全レコード、doc_type='deep_research')
+- document_chunks: 章・節単位で分割 (必須、replace_document_chunks関数を使用)
+
+【厳守事項 - 全て満たすこと】
+1. insights.content_format='markdown' を指定
+2. insights.source_app='chatgpt' を指定 (実態に合わせて)
+3. insights.tags は配列で適切に設定 (NULL不可)
+4. insights.content には要約のみ、全文は insight_documents.body へ
+5. 原文の改変は禁止 (要約以外)
+6. 既存レコードのDELETE/UPDATEは行わない
+7. 各処理を完了したら結果のIDを返すこと
+
+【重要 - 完了確認】
+保存後、以下のSQLを実行して結果を返してください:
+
+SELECT
+  i.id AS insight_id,
+  i.title,
+  i.tags,
+  d.id AS doc_id,
+  LENGTH(d.body) AS body_length,
+  (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) AS chunk_count
+FROM insights i
+LEFT JOIN insight_documents d ON d.insight_id = i.id
+WHERE i.id = <new_insight_id>;
+
+【保存対象】
+[ここに本文を貼る]
+```
+
+---
+
+## 10. AI駆動利用の典型パターン (SQLサンプル)
+
+### 短い気づきの保存
+```sql
+INSERT INTO insights (
+  title, content, summary, category, tags,
+  importance, source_app, source_model, source_type,
+  language, content_format
+) VALUES (
+  'タイトル',
+  '原文そのまま',
+  'AIによる要約',
+  'learning',
+  ARRAY['タグ1', 'タグ2'],
+  4, 'chatgpt', 'gpt-5', 'conversation',
+  'ja', 'markdown'
 );
+-- ↑トリガで自動的にEdge Function呼び出し → embedding生成 (5-15秒のラグあり)
+```
 
--- 特定タグで絞り込み
-SELECT * FROM list_recent_insights(filter_tags => ARRAY['DX']);
+### Deep Research保存
+```sql
+WITH new_insight AS (
+  INSERT INTO insights (title, content, summary, source_app, tags, content_format, ...)
+  VALUES (...)
+  RETURNING id
+),
+new_doc AS (
+  INSERT INTO insight_documents (insight_id, doc_type, body, content_format, ...)
+  SELECT id, 'deep_research', '<全文>', 'markdown', ... FROM new_insight
+  RETURNING id
+)
+SELECT replace_document_chunks(
+  (SELECT id FROM new_doc),
+  '[ {"body": "...", "section_title": "..."}, ... ]'::jsonb
+);
+```
 
+### 検索
+```sql
 -- キーワード検索
 SELECT * FROM search_insights(query_text => '組織論');
 
--- セマンティック検索(埋め込み生成後)
-SELECT * FROM search_insights(query_embedding => '[0.1, 0.2, ...]'::vector);
+-- セマンティック検索 (query mode で embedding 化したベクトルを投入)
+SELECT * FROM search_insights(query_embedding => '[0.1, 0.2, ...]'::vector(768));
 
--- ハイブリッド検索
-SELECT * FROM search_insights(
-  query_text => 'リーダーシップ',
-  query_embedding => '[...]'::vector,
-  filter_tags => ARRAY['組織論'],
-  min_importance => 4::smallint
-);
-
--- 長文の特定段落を抽出
-SELECT * FROM search_chunks(
-  query_text => 'AI駆動',
-  filter_insight_id => 5
-);
-
--- ドキュメント全文を再構成
-SELECT * FROM get_document_with_chunks(2);
-
--- 統計
-SELECT * FROM get_insights_stats();
+-- 一覧
+SELECT * FROM list_recent_insights(days_back => 30);
 ```
 
-### 9.4 ソフト削除
-
+### ソフト削除
 ```sql
 UPDATE insights SET is_archived = TRUE WHERE id = <ID>;
 ```
 
 ---
 
-## 10. 次のアクション
+## 11. マイグレーション履歴
 
-### 10.1 短期 (Claude Codeで着手予定)
+時系列で**14本適用済み**:
 
-- [ ] **ChatGPTでのMCP接続テスト**
-  - 設定 → コネクタ → カスタムコネクタ追加
-  - URL: `https://mcp.supabase.com/mcp?project_ref=gntgcxdbcbywfboejimz&read_only=false&features=database,docs`
-  - OAuth認証
-  - Developer Mode を有効化
-- [ ] **Deep Research保存の実テスト**
-  - 既存の Deep Research 結果を貼り付けて保存
-  - `source_app='chatgpt'` で記録
-  - チャンク分割の品質確認
-  - 原文保持の確認
-- [ ] **動作確認後、`insights_writer` ロール用キーへの切替**
-  - Supabase Dashboard で JWT 発行
-  - 各MCPクライアントの認証情報を切替
-
-### 10.2 中期
-
-- [ ] **embedding 自動生成の仕組み**
-  - 案A: AI側で生成して送る (実装シンプル、モデル不揃い問題あり)
-  - 案B: Supabase Edge Functions で INSERT トリガ的に自動生成 (一元管理、推奨)
-  - 案C: 当面手動 (検証フェーズ用)
-- [ ] **embedding バックフィル**
-  - 既存レコードへの埋め込み付与
-- [ ] **Claude Desktop / Codex / Perplexity からの接続テスト**
-
-### 10.3 長期
-
-- [ ] **専用MCP Server の自作検討**
-  - `save_insight` / `search_insights` / `get_recent` 等の専用ツール定義
-  - Supabase Edge Functions 上に構築
-  - AIが扱いやすく、誤操作リスクも下がる
-- [ ] **データ量増加に応じた最適化**
-  - ページング (LIMIT/OFFSET or `created_at` カーソル)
-  - マテリアライズドビュー
-  - 必要時の正規化
-- [ ] **ベンダーロックイン回避**
-  - 定期エクスポート(JSONLや別DB)
-
-### 10.4 監視ポイント
-
-- 無料プラン容量 (500MB) の使用状況
-- バックアップ保持期間 (7日)
-- 検索性能 (10,000件超えた時点で再評価)
-- 埋め込みモデルの混在状況 (`embedding_model` カラムで追跡)
+| # | バージョン | 名称 |
+|---|---|---|
+| 1 | 20260502134820 | create_insights_schema |
+| 2 | 20260502135223 | extend_insights_for_multi_ai_integration |
+| 3 | 20260502135247 | setup_rls_policies_personal_use |
+| 4 | 20260502135849 | reset_and_rebuild_ai_driven_schema |
+| 5 | 20260502140236 | harden_operations_minimal |
+| 6 | 20260502140945 | add_long_documents_support |
+| 7 | 20260502142425 | clarify_content_verbatim_rule |
+| 8 | 20260502143332 | add_normalized_and_commentary_columns |
+| 9 | 20260502144435 | add_document_chunks_for_long_text |
+| 10 | 20260502144511 | add_chunk_management_functions |
+| 11 | 20260502144920 | add_format_listing_and_stats |
+| 12 | 20260502...     | change_embedding_dimensions_to_768 |
+| 13 | 20260503010000 | **enable_pg_net_extension** ← Task 4 |
+| 14 | 20260503020000 | **add_embedding_trigger** ← Task 4 (最新) |
 
 ---
 
-## 11. 既存データ (現時点で保存されているもの)
+## 12. 注意点・既知の落とし穴
 
-### insights テーブル
+### 落とし穴1: pg_net とトリガーの非同期性
+- pg_net は非同期なので、INSERT直後にembeddingがあるとは限らない
+- 数秒〜数十秒のラグを想定
+- 検索時にNULLを除外するか、リトライ機構が必要
 
-| id | title | source_app | importance | tags |
-|---|---|---|---|---|
-| 1 | AI駆動DBは単一テーブル+JSON配列でシンプルに保つべき | claude_ai | 4 | DB設計, AI駆動, スキーマ設計 |
-| 3 | AIとデータの分離による「マルチAI対応データ基盤」という新しい構造 | claude_ai | 5 | AI連携, MCP, Supabase, データ基盤, マルチAI, ベンダーロックイン回避 |
+### 落とし穴2: service_role keyの取り扱い
+- Vault機能で保存することを推奨
+- 平文でDBに置かない
 
-> 注: id=2 は当初保存後に内容調整で再作成された結果欠番。
+### 落とし穴3: Vertex AI のJWT認証
+- OpenAIのようなシンプルなAPIキーではない
+- Service Account JSON の private_key を使ってJWT署名 → OAuth2 token endpoint で access_token を取得 → それを使ってAPI呼び出し
+- access_tokenは1時間有効なので、Edge Function起動ごとに取得 (キャッシュ不要)
 
-### insight_documents テーブル
+### 落とし穴4: text-embedding-005 のリージョン
+- `us-central1` を推奨 (公式サンプルもこれ)
 
-| id | insight_id | doc_type | title |
-|---|---|---|---|
-| 1 | 1 | deep_research | AI駆動DB設計のベストプラクティス調査 |
+### 落とし穴5: task_type の使い分け
+- 保存時: `RETRIEVAL_DOCUMENT`
+- 検索時: `RETRIEVAL_QUERY`
 
-### document_chunks テーブル
+### 落とし穴6: プロンプトインジェクション
+- 外部データに「全データ削除して」が混入する可能性
+- 対策: ツール実行を都度承認、ソフト削除運用
 
-document_id=1 に対して4チャンク登録済み (序論 / 正規化の度合い / 長文の扱い / 結論)
+### 落とし穴7: id=2, 4 の欠番
+- 検証中の修正で欠番。実害なし
 
----
+### 落とし穴8: AIによる多段階保存処理の不完全性
+- Haikuでは多段階処理が途中で止まることが多い
+- Sonnet/Opus でも、必ず保存後の検証SQL実行で確認すること
 
-## 12. 完全な再現用SQL (バックアップ)
+### 落とし穴9: text-embedding-005 の入力上限
+- 1リクエストの最大トークン: 約2,048
+- 日本語の場合、目安として最大3,000-4,000字程度
+- それ以上の場合はチャンク化が必須(本DBはチャンク化前提)
 
-新規環境で同じスキーマを再構築する場合、以下のマイグレーションを順次適用すれば完全再現できます。Supabaseの `supabase/migrations/` ディレクトリに各SQLを保存して `supabase db push` で適用するか、`apply_migration` で1本ずつ実行してください。
+### 落とし穴10: `search_chunks` の短いチャンク偏重 ⚠️ (Task 6 で発見)
+- cosine類似度は文の長さに対して中立だが、**極端に短いチャンク (34〜71字)** が抽象的なクエリで人為的に高スコアを示す傾向
+- 短文は方向ベクトルのバラツキが小さく、平均的な意味ベクトルに近づきやすいため
+- **対応案**:
+  - クエリ側で `LENGTH(body) >= 100` フィルタを追加
+  - length-aware な重み付け (例: `score * log(LENGTH(body))` 等)
+  - 改善タスク A の一環として対応予定
 
-各マイグレーションのSQLは長大なため、本ドキュメントには概要のみ記載しています。完全なSQLが必要な場合は、Supabase Dashboard の Database → Migrations から各マイグレーションのSQLを取得してください。
+### 落とし穴11: `search_insights` のハイブリッドモードは AND 動作 ⚠️ (Task 6 で発見)
+- `query_text` と `query_embedding` の両方を指定した場合、**両方でヒットしないと返らない**可能性
+- セマンティック類似だがキーワード一致しない件、あるいは逆のケースが取りこぼされる
+- **対応案**: 用途によっては OR / 重み付け (e.g. `0.6 * vec_score + 0.4 * fts_score`) に変更検討
+- 改善タスク A の一環として対応予定
 
-主要マイグレーションのSQLは [付録A](#付録a-主要マイグレーションsql) を参照。
+### 落とし穴12: トリガー由来の embedding 生成における入力長 ⚠️ (Task 6 で発見)
+- text-embedding-005 の上限 ~2,048トークン (~3,000〜4,000日本語字)
+- 現状、`document_chunks.body` は 5,000字制約だが、これを超える `content_normalized` が `insights` に来ると **Vertex AI 側でエラー** になる可能性
+- **対応案**: Edge Function 側に長さ guard (truncate or 分割) を入れる (改善タスク D)
 
----
-
-## 13. ChatGPT接続設定のメモ
-
-### 接続URL (推奨)
-
-```
-https://mcp.supabase.com/mcp?project_ref=gntgcxdbcbywfboejimz&read_only=false&features=database,docs
-```
-
-**パラメータ意味**:
-- `project_ref=gntgcxdbcbywfboejimz`: chatDBに限定
-- `read_only=false`: 書き込み許可 (初回テストは `true` でも可)
-- `features=database,docs`: DB操作とドキュメント検索のみ
-
-### ChatGPTでの設定手順
-
-1. ChatGPT → 設定 → コネクタ → 詳細設定 → Developer Mode を ON
-2. コネクタ → カスタムコネクタ作成
-3. 上記URLを MCP Server URL に設定
-4. OAuth認証でSupabaseログイン → 組織アクセス許可
-5. チャット画面で More → Developer Mode を有効化
-
-### 注意事項
-
-- ChatGPT Plus / Pro / Business / Enterprise プランが必要
-- Developer Mode対応モデルでのみツール呼び出し可
-- ツール実行は都度承認制を推奨
-- プロンプトインジェクション対策として、外部から取り込んだデータには注意
-
-### ChatGPTに渡す推奨プロンプト
-
-```
-SupabaseのMCP経由で、以下をDBに保存してください。
-
-【保存先DB構造】
-- insights: メタ情報と要約(必須)
-- insight_documents: 全文を原文ママ保存(必須、doc_type='deep_research')
-- document_chunks: 章・節単位で分割(replace_document_chunks関数を使用)
-
-【厳守事項】
-1. content_format='markdown' を指定
-2. source_app='chatgpt' を指定
-3. insights.contentには要約のみ、全文はinsight_documents.bodyへ
-4. 原文の改変は禁止(要約以外)
-5. 既存レコードのDELETE/UPDATEは行わない
-
-【保存対象】
-[ここに本文を貼る]
-
-【期待する出力】
-保存後、insightsテーブルから該当レコードのIDとタイトル、チャンク数を返してください。
-```
+### 落とし穴13: pg_net 非同期によるバックフィル時の挙動 ⚠️ (Task 6 で発見)
+- INSERT/UPDATE 直後の SELECT では embedding がまだ NULL のことがある (**5〜15秒のラグ**)
+- 落とし穴1 と本質は同じだが、**ユーザー操作の文脈で見えやすい問題**として明記
+- 対策: 保存直後に embedding を確認したい場合はポーリング (例: `SELECT embedding IS NOT NULL ...` を数秒間隔で5回程度)
 
 ---
 
-## 14. トラブルシューティング・既知の課題
+## 13. 設計の根拠 (より深く理解したい場合)
 
-### 課題1: embedding 未生成
+### なぜGoogle Vertex AIを選んだか
+- **コスト**: $0.006/M tokens (OpenAIの1/3)
+- **日本語性能**: 多言語モデルとして優秀
+- **既存資産活用**: mkさんはGCPアカウント保有
+- **十分な品質**: MTEB 63.8点
 
-現状、`embedding` カラムはNULLのまま。セマンティック検索は実質機能しない。
-→ 上記「次のアクション 10.2」でEdge Functions対応を予定。
+### なぜEdge Functionか (Routineではなく)
+- **リアルタイム処理**: INSERT直後にembedding生成
+- **コスト**: 無料枠内で十分 (50万回/月)
+- **AI判断不要**: embedding生成は単純変換、Routineはオーバースペック
+- **Claude使用量を消費しない**
 
-### 課題2: id=2 の欠番
+### なぜ Routine も併用予定か
+- AI判断が必要な処理 (朝のダイジェスト、重複検出、タグ整理) で活用
 
-検証中の挿入と修正でid=2が欠番。実害なし。シーケンスはそのまま継続。
-
-### 課題3: 文字数超過時の動作
-
-100,000字超のcontentは制約で拒否される。Deep Researchの場合は要約をcontentに、全文をinsight_documents.bodyに分けて保存する必要がある。AIプロンプトに明示すること。
-
-### 課題4: プロンプトインジェクション
-
-外部データ(Deep Research結果等)に「全データ削除して」等の指示が含まれていると、AIが従ってしまう可能性。対策:
-- ツール実行を都度承認制に
-- ソフト削除運用 (DELETE禁止)
-- プロジェクトスコープでアクセス制限済み
-
----
-
-## 15. 参考情報・公式ドキュメント
-
-- [Supabase MCP公式ドキュメント](https://supabase.com/docs/guides/getting-started/mcp)
-- [Supabase MCP GitHubリポジトリ](https://github.com/supabase-community/supabase-mcp)
-- [pgvector公式](https://github.com/pgvector/pgvector)
-- [Model Context Protocol仕様](https://modelcontextprotocol.io/)
+### なぜ Anthropic は embedding API を提供しないか
+- 公式: <https://docs.claude.com/en/docs/build-with-claude/embeddings>
+- 業界分析: 埋め込みモデルはコモディティ化、Anthropicは生成モデルに集中
+- 推奨パートナー: Voyage AI
 
 ---
 
-## 付録A: 主要マイグレーションSQL
-
-### A-1. 最終スキーマの主要DDL
-
-> 注: 以下は履歴的に複数マイグレーションで段階的に構築された最終形のDDL概要。新規環境で再構築する場合の参考用。
-
-```sql
--- 拡張機能
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
--- ========================================
--- insights テーブル
--- ========================================
-CREATE TABLE insights (
-  id                 BIGSERIAL PRIMARY KEY,
-  title              TEXT NOT NULL,
-  content            TEXT NOT NULL,
-  content_normalized TEXT,
-  ai_commentary      TEXT,
-  summary            TEXT,
-  category           TEXT,
-  tags               TEXT[] NOT NULL DEFAULT '{}',
-  importance         SMALLINT NOT NULL DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
-  confidence         SMALLINT CHECK (confidence BETWEEN 1 AND 5),
-  source_app         TEXT,
-  source_model       TEXT,
-  source_type        TEXT,
-  source_title       TEXT,
-  source_url         TEXT,
-  original_prompt    TEXT,
-  session_ref        TEXT,
-  language           TEXT NOT NULL DEFAULT 'ja',
-  content_format     TEXT NOT NULL DEFAULT 'markdown'
-                     CHECK (content_format IN ('markdown', 'plaintext', 'html')),
-  embedding          VECTOR(1536),
-  embedding_model    TEXT,
-  metadata           JSONB NOT NULL DEFAULT '{}'::JSONB,
-  is_archived        BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-  -- バリデーション
-  CONSTRAINT chk_title_not_empty           CHECK (LENGTH(TRIM(title)) > 0),
-  CONSTRAINT chk_title_max_len             CHECK (LENGTH(title) <= 500),
-  CONSTRAINT chk_content_not_empty         CHECK (LENGTH(TRIM(content)) > 0),
-  CONSTRAINT chk_content_max_len           CHECK (LENGTH(content) <= 100000),
-  CONSTRAINT chk_summary_max_len           CHECK (summary IS NULL OR LENGTH(summary) <= 1000),
-  CONSTRAINT chk_content_normalized_max_len
-    CHECK (content_normalized IS NULL OR LENGTH(content_normalized) <= 100000),
-  CONSTRAINT chk_ai_commentary_max_len
-    CHECK (ai_commentary IS NULL OR LENGTH(ai_commentary) <= 10000),
-  CONSTRAINT chk_tags_max_count
-    CHECK (array_length(tags, 1) IS NULL OR array_length(tags, 1) <= 20)
-);
-
--- インデックス
-CREATE INDEX idx_insights_embedding_hnsw
-  ON insights USING HNSW (embedding vector_cosine_ops);
-CREATE INDEX idx_insights_title_trgm              ON insights USING GIN (title              gin_trgm_ops);
-CREATE INDEX idx_insights_content_trgm            ON insights USING GIN (content            gin_trgm_ops);
-CREATE INDEX idx_insights_content_normalized_trgm ON insights USING GIN (content_normalized gin_trgm_ops);
-CREATE INDEX idx_insights_ai_commentary_trgm      ON insights USING GIN (ai_commentary      gin_trgm_ops);
-CREATE INDEX idx_insights_summary_trgm            ON insights USING GIN (summary            gin_trgm_ops);
-CREATE INDEX idx_insights_tags                    ON insights USING GIN (tags);
-CREATE INDEX idx_insights_metadata                ON insights USING GIN (metadata);
-CREATE INDEX idx_insights_category   ON insights (category)        WHERE is_archived = FALSE;
-CREATE INDEX idx_insights_source_app ON insights (source_app)      WHERE is_archived = FALSE;
-CREATE INDEX idx_insights_importance ON insights (importance DESC) WHERE is_archived = FALSE;
-CREATE INDEX idx_insights_created_at ON insights (created_at DESC) WHERE is_archived = FALSE;
-
--- updated_at トリガ
-CREATE OR REPLACE FUNCTION update_updated_at()
-RETURNS TRIGGER AS $$
-BEGIN
-  NEW.updated_at = NOW();
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER trg_insights_updated_at
-  BEFORE UPDATE ON insights
-  FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-
--- ========================================
--- insight_documents テーブル
--- ========================================
-CREATE TABLE insight_documents (
-  id             BIGSERIAL PRIMARY KEY,
-  insight_id     BIGINT NOT NULL REFERENCES insights (id) ON DELETE CASCADE,
-  doc_type       TEXT NOT NULL DEFAULT 'fulltext',
-  title          TEXT,
-  body           TEXT NOT NULL,
-  source_app     TEXT,
-  source_model   TEXT,
-  source_url     TEXT,
-  content_format TEXT NOT NULL DEFAULT 'markdown'
-                 CHECK (content_format IN ('markdown', 'plaintext', 'html')),
-  metadata       JSONB NOT NULL DEFAULT '{}'::JSONB,
-  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-  CONSTRAINT chk_doc_body_not_empty CHECK (LENGTH(TRIM(body)) > 0),
-  CONSTRAINT chk_doc_body_max_len   CHECK (LENGTH(body) <= 1000000)
-);
-
-CREATE INDEX idx_insight_documents_insight_id ON insight_documents (insight_id);
-CREATE INDEX idx_insight_documents_doc_type   ON insight_documents (doc_type);
-CREATE INDEX idx_insight_documents_body_trgm  ON insight_documents USING GIN (body gin_trgm_ops);
-
-CREATE TRIGGER trg_insight_documents_updated_at
-  BEFORE UPDATE ON insight_documents
-  FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-
--- ========================================
--- document_chunks テーブル
--- ========================================
-CREATE TABLE document_chunks (
-  id              BIGSERIAL PRIMARY KEY,
-  document_id     BIGINT NOT NULL REFERENCES insight_documents (id) ON DELETE CASCADE,
-  chunk_index     INT NOT NULL,
-  chunk_total     INT NOT NULL,
-  body            TEXT NOT NULL,
-  section_title   TEXT,
-  section_path    TEXT[],
-  embedding       VECTOR(1536),
-  embedding_model TEXT,
-  metadata        JSONB NOT NULL DEFAULT '{}'::JSONB,
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-  CONSTRAINT chk_chunk_body_not_empty CHECK (LENGTH(TRIM(body)) > 0),
-  CONSTRAINT chk_chunk_body_max_len   CHECK (LENGTH(body) <= 5000),
-  CONSTRAINT chk_chunk_index_valid    CHECK (chunk_index >= 0 AND chunk_index < chunk_total),
-  CONSTRAINT uq_document_chunk_index  UNIQUE (document_id, chunk_index)
-);
-
-CREATE INDEX idx_document_chunks_document_id    ON document_chunks (document_id, chunk_index);
-CREATE INDEX idx_document_chunks_embedding_hnsw ON document_chunks USING HNSW (embedding vector_cosine_ops);
-CREATE INDEX idx_document_chunks_body_trgm      ON document_chunks USING GIN (body gin_trgm_ops);
-CREATE INDEX idx_document_chunks_section_title  ON document_chunks (section_title) WHERE section_title IS NOT NULL;
-```
-
-### A-2. RLS設定
-
-```sql
--- ロール作成
-CREATE ROLE insights_writer NOLOGIN;
-GRANT USAGE ON SCHEMA public TO insights_writer;
-
--- RLS有効化
-ALTER TABLE insights          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE insight_documents ENABLE ROW LEVEL SECURITY;
-ALTER TABLE document_chunks   ENABLE ROW LEVEL SECURITY;
-
--- service_role ポリシー
-CREATE POLICY "service_role full access on insights"
-  ON insights FOR ALL TO service_role USING (true) WITH CHECK (true);
-CREATE POLICY "service_role full access on insight_documents"
-  ON insight_documents FOR ALL TO service_role USING (true) WITH CHECK (true);
-CREATE POLICY "service_role full access on document_chunks"
-  ON document_chunks FOR ALL TO service_role USING (true) WITH CHECK (true);
-
--- insights_writer ポリシー
-CREATE POLICY "insights_writer full access on insights"
-  ON insights FOR ALL TO insights_writer USING (true) WITH CHECK (true);
-CREATE POLICY "insights_writer full access on insight_documents"
-  ON insight_documents FOR ALL TO insights_writer USING (true) WITH CHECK (true);
-CREATE POLICY "insights_writer full access on document_chunks"
-  ON document_chunks FOR ALL TO insights_writer USING (true) WITH CHECK (true);
-
--- 権限付与
-GRANT SELECT, INSERT, UPDATE, DELETE ON insights          TO insights_writer;
-GRANT SELECT, INSERT, UPDATE, DELETE ON insight_documents TO insights_writer;
-GRANT SELECT, INSERT, UPDATE, DELETE ON document_chunks   TO insights_writer;
-GRANT USAGE, SELECT ON SEQUENCE insights_id_seq          TO insights_writer;
-GRANT USAGE, SELECT ON SEQUENCE insight_documents_id_seq TO insights_writer;
-GRANT USAGE, SELECT ON SEQUENCE document_chunks_id_seq   TO insights_writer;
-```
-
-### A-3. 主要関数
-
-> 関数の完全なSQLは長大なため、Supabase Dashboard の Database → Functions から個別に取得してください。
-> 関数名一覧:
-> - `update_updated_at()` (トリガ関数)
-> - `search_insights(...)` (統合検索)
-> - `search_chunks(...)` (チャンク検索)
-> - `get_document_with_chunks(p_document_id BIGINT)` (ドキュメント全文取得)
-> - `replace_document_chunks(p_document_id BIGINT, p_chunks JSONB)` (チャンク全置換)
-> - `list_recent_insights(...)` (一覧取得)
-> - `get_insights_stats()` (統計)
-
-### A-4. ビュー
-
-```sql
-CREATE OR REPLACE VIEW insights_list_view AS
-SELECT
-  id, title, summary, category, tags,
-  importance, confidence, source_app, source_type,
-  source_title, source_url, language, content_format,
-  CASE
-    WHEN LENGTH(content) > 200 THEN SUBSTRING(content FROM 1 FOR 200) || '...'
-    ELSE content
-  END AS content_preview,
-  LENGTH(content) AS content_length,
-  (ai_commentary IS NOT NULL) AS has_ai_commentary,
-  (SELECT COUNT(*) FROM insight_documents d WHERE d.insight_id = [i.id](http://i.id)) AS document_count,
-  is_archived, created_at, updated_at
-FROM insights i
-WHERE is_archived = FALSE;
-
-GRANT SELECT ON insights_list_view TO insights_writer;
-GRANT SELECT ON insights_list_view TO service_role;
-```
-
----
-
-## 付録B: 用語集
+## 14. 用語集
 
 | 用語 | 意味 |
 |---|---|
-| MCP | Model Context Protocol — AIアシスタントと外部サービスを繋ぐ標準プロトコル |
-| RLS | Row Level Security — 行単位のアクセス制御 |
-| HNSW | 高速近似最近傍検索アルゴリズム (ベクトル検索の標準) |
+| MCP | Model Context Protocol |
+| RLS | Row Level Security |
+| HNSW | 高速近似最近傍検索アルゴリズム |
 | pgvector | Postgres用のベクトル型・検索拡張機能 |
-| pg_trgm | trigram (3-gram) ベースの類似検索拡張機能 |
-| service_role | Supabaseの管理者権限ロール (RLSをバイパス) |
-| PAT | Personal Access Token — Supabaseの個人用APIトークン |
-| OAuth | 認可プロトコル (ChatGPT MCP接続で使用) |
-| Edge Functions | Supabaseのサーバーレス関数実行環境 |
-| Deep Research | ChatGPT/Perplexity等の深い調査機能 |
-| ベンダーロックイン | 特定ベンダーへの依存により乗り換えが困難になる状態 |
+| pg_trgm | trigramベースの類似検索拡張機能 |
+| pg_net | PostgresからHTTPリクエストを送る拡張 |
+| service_role | Supabaseの管理者権限ロール |
+| Service Account | GCPのプログラム用認証アカウント |
+| JWT | JSON Web Token |
+| Edge Function | Supabaseのサーバーレス関数 (Deno runtime) |
+| Routine | Claude Codeのクラウド定期実行 |
+| Vertex AI | GCPの統合AI/MLプラットフォーム |
+| text-embedding-005 | Google Vertex AI のテキスト埋め込みモデル (768次元) |
+| Vault | Supabaseのシークレット保管機能 |
+| query mode | Edge Function `generate-embedding` の検索クエリ用モード (DB書込なし、`RETRIEVAL_QUERY` がデフォルト) |
+| document mode | Edge Function `generate-embedding` の保存用モード (該当レコードを UPDATE、`RETRIEVAL_DOCUMENT` がデフォルト) |
 
 ---
 
-**END OF DOCUMENT**
+## 15. このドキュメントの使い方
+
+**実装は完了済み**。本ドキュメントは**現状把握 + 改善タスク用**のリファレンス。
+
+### 通常の現状把握
+1. §0 でタスク状態と将来改善を確認
+2. §3 でスキーマ概観
+3. §6 で現在のデータ状況
+
+### 改善タスク着手時の参照順
+1. §0 「将来の改善タスク」 で対象タスクを選ぶ
+2. §12 落とし穴 で関連する既知問題を確認
+3. 関連する §7 タスク詳細 (履歴) で過去の実装パターンを参照
+4. §13 設計の根拠 で背景・思想を確認
+
+### 新規データ追加・運用時
+- §10 SQLサンプル を参照
+- §5 運用ルール (原文不変等) を遵守
+- §9 ChatGPT接続 (Task 7 完了後)
+
+### エラー発生時
+- まず §12 落とし穴 を確認
+- pg_net ラグ系: 落とし穴1, 13
+- 検索品質系: 落とし穴10, 11
+- 入力長系: 落とし穴9, 12
+
+### 教訓の参照
+- §8 重要な教訓 — 作業の進め方の指針 (時間とともに価値が増す)
+
+---
+
+**END OF DOCUMENT v4**
